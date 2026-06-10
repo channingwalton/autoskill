@@ -104,6 +104,13 @@ Rules that make the loop trustworthy:
 
 ## Reading the results
 
+`bin/autoskill report runs/<id>` summarises a run: baseline vs champion (with
+deltas), verdict counts, spend, the accepted-mutation lineage, a per-task
+comparison, and a health warning if any trials errored. **The winning skill is
+`runs/<id>/champion/SKILL.md`** — if that file is absent, no candidate ever
+beat the bare-model baseline and the champion is still the empty skill (the
+null result, provided the run was healthy).
+
 Everything lands in `runs/<id>/`:
 
 - `ledger.jsonl` — one row per iteration: mutation summary, diff stat, stage-1 /

@@ -68,7 +68,10 @@ is a finding, not a failure.
 
 ## 🔍 ANALYSE
 
-From the ledger (`jq` over `ledger.jsonl`):
+Start with `bin/autoskill report runs/<name>` — baseline vs champion, verdict
+mix, spend, lineage, per-task deltas, and a trial-error health warning. A
+missing `champion/SKILL.md` means the empty skill is still champion (null
+result, if healthy). Then deepen from the ledger (`jq` over `ledger.jsonl`):
 
 1. Trajectory: champion aggregate over iterations vs baseline, opt and holdout.
 2. Verdict mix: accepts / reject-stage1 / reject-full / reject-holdout /

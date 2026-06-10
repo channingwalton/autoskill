@@ -903,6 +903,87 @@ def cmd_evolve(args):
     return 0
 
 
+def cmd_report(args):
+    run_dir = args.run_dir
+    entries = read_ledger(run_dir)
+    if not entries:
+        print("no ledger at %s — nothing to report" % ledger_path(run_dir))
+        return 1
+    config = load_config(run_dir)
+    baseline = next((e for e in entries if e.get("type") == "baseline"), None)
+    iterations = [e for e in entries if e.get("type") == "iteration"]
+    _, _, spent = resume_state(entries)
+
+    print("run: %s   suite: %s   model: %s   mutator: %s" % (
+        os.path.basename(os.path.abspath(run_dir)), config["suite"],
+        config.get("model", "?"), config.get("mutator_model", config.get("model", "?"))))
+
+    if baseline is None:
+        print("no baseline row — run `autoskill baseline` first")
+        return 1
+    print("baseline (no skill):  opt %+0.3f   holdout %+0.3f"
+          % (baseline["opt_agg"], baseline["holdout_agg"]))
+
+    champion = None
+    if os.path.exists(champion_paths(run_dir)[1]):
+        champion = read_champion(run_dir)
+    if champion and champion["iter"] > 0:
+        print("champion (iter %d):   opt %+0.3f (%+0.3f)   holdout %+0.3f (%+0.3f)"
+              % (champion["iter"], champion["opt_agg"],
+                 champion["opt_agg"] - baseline["opt_agg"],
+                 champion["holdout_agg"],
+                 champion["holdout_agg"] - baseline["holdout_agg"]))
+        print("winning skill:        %s" % os.path.join(run_dir, "champion", "SKILL.md"))
+    else:
+        print("champion:             none — no candidate has beaten the bare-model"
+              " baseline (the null result, if the run is finished and healthy)")
+
+    verdicts = {}
+    for e in iterations:
+        verdicts[e.get("verdict", "?")] = verdicts.get(e.get("verdict", "?"), 0) + 1
+    accepts = verdicts.get("accept", 0)
+    print("iterations: %d   verdicts: %s" % (
+        len(iterations),
+        ", ".join("%s %d" % (k, v) for k, v in sorted(verdicts.items()))))
+    print("spend: $%.2f total%s" % (
+        spent, ("   ($%.2f per accept)" % (spent / accepts)) if accepts else ""))
+
+    accepted = [e for e in iterations if e.get("verdict") == "accept"]
+    if accepted:
+        print("\naccepted lineage:")
+        for e in accepted:
+            print("  iter %-3d %-9s opt %+0.3f  %s"
+                  % (e["iter"], e.get("diff_stat", "?"),
+                     (e.get("full") or {}).get("agg", float("nan")),
+                     e.get("mutation_summary", "?")))
+            print("           candidate: %s"
+                  % os.path.join(run_dir, "candidates", str(e["iter"]), "SKILL.md"))
+
+    if (champion and champion["iter"] > 0 and champion.get("per_task")
+            and baseline.get("per_task")):
+        print("\nper-task, champion vs baseline:")
+        for tid in sorted(baseline["per_task"]):
+            b = baseline["per_task"][tid]
+            c = champion["per_task"].get(tid)
+            if c is None:
+                continue
+            print("  %-28s %+0.3f -> %+0.3f  (%+0.3f)" % (tid, b, c, c - b))
+
+    # health: error trials produce flat trajectories that mimic the null result
+    errors = 0
+    trials_root = os.path.join(run_dir, "trials")
+    if os.path.isdir(trials_root):
+        for root, _, files in os.walk(trials_root):
+            if "score.json" in files:
+                with open(os.path.join(root, "score.json")) as f:
+                    if json.load(f).get("is_error"):
+                        errors += 1
+    if errors:
+        print("\nwarning: %d trial(s) errored (timeout/crash/max-turns) — check "
+              "before reading this run as a result" % errors)
+    return 0
+
+
 # ---------------------------------------------------------------- main
 
 def main(argv=None):
@@ -952,6 +1033,11 @@ def main(argv=None):
     p.add_argument("run_dir")
     p.add_argument("--hours", type=float, help="wall-clock deadline")
     p.set_defaults(fn=cmd_evolve)
+
+    p = sub.add_parser("report", help="summarise a run: baseline vs champion, "
+                                      "verdicts, spend, lineage")
+    p.add_argument("run_dir")
+    p.set_defaults(fn=cmd_report)
 
     args = parser.parse_args(argv)
     return args.fn(args) or 0
