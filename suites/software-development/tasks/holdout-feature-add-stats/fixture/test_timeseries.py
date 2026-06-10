@@ -17,8 +17,20 @@ class TestTimeSeries(unittest.TestCase):
             series.add_point(timestamp, value)
         self.assertEqual(
             series.summary(),
-            {"count": 3, "min": 1, "max": 7, "mean": 4.0, "median": 4},
+            {
+                "count": 3,
+                "min": 1,
+                "max": 7,
+                "mean": 4.0,
+                "median": 4,
+                "stdev": 2.4495,
+            },
         )
+
+    def test_add_point_rejects_strings(self):
+        series = TimeSeries()
+        with self.assertRaises(TypeError):
+            series.add_point(1, "10")
 
 
 if __name__ == "__main__":

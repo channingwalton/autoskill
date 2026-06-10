@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-TOTAL_FALLBACK = 8
+TOTAL_FALLBACK = 13
 
 try:
     from memo import MemoCache, _MISSING
@@ -75,6 +75,58 @@ class HiddenTests(unittest.TestCase):
         cache.put("b", 2)
         cache.invalidate("a")
         cache.put("c", 3)
+        self.assertEqual(cache.get("b"), 2)
+        self.assertEqual(cache.get("c"), 3)
+
+    # ----- documented guarantees: live count -------------------------------
+    def test_len_counts_live_entries(self):
+        cache = MemoCache()
+        cache.put("a", 1)
+        cache.put("b", 2)
+        self.assertEqual(len(cache), 2)
+        cache.invalidate("a")
+        self.assertEqual(len(cache), 1)
+        cache.invalidate("ghost")
+        self.assertEqual(len(cache), 1)
+        cache.put("a", 3)
+        self.assertEqual(len(cache), 2)
+
+    def test_report_live_count_after_refresh(self):
+        builder = ReportBuilder({"intro": "hello", "body": "text"})
+        builder.section("intro")
+        builder.section("body")
+        self.assertEqual(builder.cached_sections(), 2)
+        builder.refresh("intro")
+        self.assertEqual(builder.cached_sections(), 1)
+        builder.section("intro")
+        self.assertEqual(builder.cached_sections(), 2)
+
+    def test_report_live_count_includes_none_sections(self):
+        builder = ReportBuilder({"notes": None, "intro": "hi"})
+        builder.section("notes")
+        builder.section("intro")
+        self.assertEqual(builder.cached_sections(), 2)
+        builder.refresh("notes")
+        self.assertEqual(builder.cached_sections(), 1)
+
+    # ----- documented guarantees: eviction order ----------------------------
+    def test_lookup_does_not_refresh_eviction_order(self):
+        cache = MemoCache(capacity=2)
+        cache.put("a", 1)
+        cache.put("b", 2)
+        cache.get("a")  # FIFO, not LRU: must not rescue "a"
+        cache.put("c", 3)
+        self.assertIs(cache.get("a"), _MISSING)
+        self.assertEqual(cache.get("b"), 2)
+        self.assertEqual(cache.get("c"), 3)
+
+    def test_overwrite_keeps_queue_position(self):
+        cache = MemoCache(capacity=2)
+        cache.put("a", 1)
+        cache.put("b", 2)
+        cache.put("a", 9)  # update in place; "a" stays oldest
+        cache.put("c", 3)
+        self.assertIs(cache.get("a"), _MISSING)
         self.assertEqual(cache.get("b"), 2)
         self.assertEqual(cache.get("c"), 3)
 

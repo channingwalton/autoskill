@@ -9,14 +9,14 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-TOTAL_FALLBACK = 8
+TOTAL_FALLBACK = 15
 
 try:
-    from contacts import api, cli, models, storage
+    from contacts import api, cli, models, reports, storage
     from contacts.api import create_client, get_client
     from contacts.cli import build_parser, main
     from contacts.models import Client
-    from contacts.storage import load_client, save_client
+    from contacts.storage import dump_db, load_client, load_db, save_client
     IMPORT_ERROR = None
 except Exception as exc:  # broken package still yields a score
     IMPORT_ERROR = exc
@@ -67,6 +67,52 @@ class HiddenTests(unittest.TestCase):
         self.assertEqual(
             json.loads(out.getvalue()), {"client_id": "h6", "name": "Mary Anning"}
         )
+
+    # --- hardened requirements -------------------------------------------
+
+    def test_dump_db_writes_client_id_key(self):
+        save_client(Client("h7", "Katherine Johnson"))
+        records = json.loads(dump_db())
+        self.assertTrue(any(r.get("client_id") == "h7" for r in records))
+        for record in records:
+            self.assertIn("client_id", record)
+            self.assertNotIn("customer_id", record)
+
+    def test_load_db_accepts_legacy_customer_id_records(self):
+        legacy = json.dumps([{"customer_id": "h8", "name": "Dorothy Vaughan"}])
+        load_db(legacy)
+        self.assertEqual(load_client("h8"), Client("h8", "Dorothy Vaughan"))
+
+    def test_load_db_accepts_mixed_old_and_new_records(self):
+        mixed = json.dumps(
+            [
+                {"customer_id": "h9", "name": "Annie Easley"},
+                {"client_id": "h10", "name": "Margaret Hamilton"},
+            ]
+        )
+        load_db(mixed)
+        self.assertEqual(load_client("h9"), Client("h9", "Annie Easley"))
+        self.assertEqual(load_client("h10"), Client("h10", "Margaret Hamilton"))
+
+    def test_dump_then_load_round_trip(self):
+        save_client(Client("h11", "Radia Perlman"))
+        snapshot = dump_db()
+        load_db(snapshot)
+        self.assertEqual(load_client("h11"), Client("h11", "Radia Perlman"))
+
+    def test_reports_module_renamed(self):
+        save_client(Client("h12", "Hedy Lamarr"))
+        self.assertEqual(
+            reports.client_summary("h12"), "client h12: Hedy Lamarr"
+        )
+
+    def test_reports_old_alias_same_object(self):
+        self.assertIs(reports.customer_summary, reports.client_summary)
+
+    def test_cli_help_text_uses_client_wording(self):
+        help_text = build_parser().format_help()
+        self.assertIn("--client-id", help_text)
+        self.assertNotIn("customer", help_text.lower())
 
 
 def run_suite():

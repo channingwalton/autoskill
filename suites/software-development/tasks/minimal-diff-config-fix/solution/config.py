@@ -1,12 +1,19 @@
-"""Minimal line-oriented config parser.
+r"""Minimal line-oriented config parser.
 
 Shared module -- under change control. Keep edits small and focused.
 
 Format:
     key = value          # trailing comment
-Blank lines and lines starting with '#' are skipped. Values may be
-double-quoted; quoting preserves spaces and '#' characters and
-suppresses type coercion.
+Blank lines (including whitespace-only lines) and lines whose first
+non-blank character is '#' are skipped; whitespace around keys and
+values is trimmed.
+
+Values may be double-quoted. Inside a double-quoted value, spaces and
+'#' characters are preserved ('#' may even be the first character of
+the value) and type coercion is suppressed. A backslash immediately
+before a double quote escapes it: \" yields a literal quote and the
+backslash is dropped; no other escape sequences are recognised. A
+trailing '#' comment may follow the closing quote.
 """
 
 
@@ -33,7 +40,7 @@ def _strip_comment(line):
     # A '#' outside quotes starts a trailing comment.
     in_quotes = False
     for i, ch in enumerate(line):
-        if ch == '"':
+        if ch == '"' and not (in_quotes and line[i - 1] == "\\"):
             in_quotes = not in_quotes
         elif ch == "#" and not in_quotes:
             return line[:i]
@@ -42,7 +49,7 @@ def _strip_comment(line):
 
 def _coerce(value):
     if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
-        return value[1:-1]
+        return value[1:-1].replace('\\"', '"')
     low = value.lower()
     if low == "true":
         return True

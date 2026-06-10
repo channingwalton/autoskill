@@ -7,9 +7,19 @@ from contacts.api import create_client, get_client
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="contacts")
-    parser.add_argument("--client-id", required=True)
-    parser.add_argument("--name")
+    parser = argparse.ArgumentParser(
+        prog="contacts",
+        description="Look up and create client records.",
+    )
+    parser.add_argument(
+        "--client-id",
+        required=True,
+        help="id of the client to look up or create",
+    )
+    parser.add_argument(
+        "--name",
+        help="if given, create a client with this name",
+    )
     return parser
 
 

@@ -26,6 +26,14 @@ class ReportBuilder:
         """Drop a cached section so the next request re-renders it."""
         self._cache.invalidate(name)
 
+    def cached_sections(self):
+        """Number of sections currently held live in the cache.
+
+        The ops dashboard charts this. Sections cached as None count;
+        refreshed sections stop counting until they are re-rendered.
+        """
+        return len(self._cache)
+
     def _render(self, name):
         self.renders += 1
         raw = self._source.get(name)

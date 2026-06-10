@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-TOTAL_FALLBACK = 7
+TOTAL_FALLBACK = 14
 
 try:
     from rota import build_rota
@@ -58,6 +58,65 @@ class HiddenTests(unittest.TestCase):
 
     def test_no_days_gives_empty_rota(self):
         self.assertEqual(build_rota(["a", "b"], []), {})
+
+    # --- contract clauses from the docstring -----------------------------
+
+    def test_skip_then_pointer_moves_past_assignee(self):
+        # After a skip the pointer continues from after the *assigned*
+        # person, not merely one step from where it started.
+        rota = build_rota(
+            ["a", "b", "c"],
+            ["d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8"],
+            unavailable={"a": {"d4", "d5"}},
+        )
+        self.assertEqual(
+            rota,
+            {
+                "d1": "a", "d2": "b", "d3": "c", "d4": "b",
+                "d5": "c", "d6": "a", "d7": "b", "d8": "c",
+            },
+        )
+
+    def test_multi_week_fairness_over_full_cycles(self):
+        days = ["d%02d" % i for i in range(1, 13)]
+        rota = build_rota(["a", "b", "c"], days)
+        counts = {}
+        for person in rota.values():
+            counts[person] = counts.get(person, 0) + 1
+        self.assertEqual(counts, {"a": 4, "b": 4, "c": 4})
+
+    def test_inputs_not_mutated(self):
+        people = ["a", "b", "c"]
+        unavailable = {"a": {"d1"}, "zed": {"d2"}}
+        build_rota(people, ["d1", "d2", "d3"], unavailable)
+        self.assertEqual(people, ["a", "b", "c"])
+        self.assertEqual(unavailable, {"a": {"d1"}, "zed": {"d2"}})
+
+    def test_repeated_calls_return_same_rota(self):
+        args = (["a", "b", "c"], ["d1", "d2", "d3", "d4"], {"b": {"d2"}})
+        first = build_rota(*args)
+        second = build_rota(*args)
+        self.assertEqual(first, second)
+
+    def test_unknown_name_in_unavailable_is_ignored(self):
+        rota = build_rota(
+            ["a", "b"], ["d1", "d2"], unavailable={"zed": {"d1", "d2"}}
+        )
+        self.assertEqual(rota, {"d1": "a", "d2": "b"})
+
+    def test_error_message_names_the_blocked_day(self):
+        with self.assertRaises(ValueError) as ctx:
+            build_rota(
+                ["a", "b"],
+                ["d1", "d2", "d3"],
+                unavailable={"a": {"d2"}, "b": {"d2"}},
+            )
+        self.assertEqual(str(ctx.exception), "no one is available on d2")
+
+    def test_empty_people_with_days_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            build_rota([], ["d1"])
+        self.assertEqual(str(ctx.exception), "no one is available on d1")
 
 
 def main():

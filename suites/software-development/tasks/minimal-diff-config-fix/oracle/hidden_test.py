@@ -9,7 +9,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-TOTAL_FALLBACK = 7
+TOTAL_FALLBACK = 13
 
 try:
     from config import parse
@@ -27,6 +27,28 @@ class HiddenTests(unittest.TestCase):
     def test_multiple_hashes_in_quotes_with_trailing_comment(self):
         cfg = parse('pattern = "a#b#c"  # delimiter notes\n')
         self.assertEqual(cfg["pattern"], "a#b#c")
+
+    # ----- quoting edges from the docstring spec ---------------------------
+    def test_hash_as_first_char_of_quoted_value(self):
+        cfg = parse('tag = "#latest"\n')
+        self.assertEqual(cfg["tag"], "#latest")
+
+    def test_escaped_quotes_inside_value(self):
+        cfg = parse('motd = "she said \\"hi\\" #1"\n')
+        self.assertEqual(cfg["motd"], 'she said "hi" #1')
+
+    def test_escaped_quotes_with_trailing_comment(self):
+        cfg = parse('note = "a \\"b\\" c"  # comment\n')
+        self.assertEqual(cfg["note"], 'a "b" c')
+
+    # ----- blank-line and whitespace handling ------------------------------
+    def test_whitespace_only_lines_skipped(self):
+        cfg = parse("key = 1\n   \n\t\nother = 2\n")
+        self.assertEqual(cfg, {"key": 1, "other": 2})
+
+    def test_indented_comment_and_padded_pairs(self):
+        cfg = parse("   # indented comment\n  spaced   =   42  \n")
+        self.assertEqual(cfg, {"spaced": 42})
 
     # ----- regressions ----------------------------------------------------
     def test_trailing_comment_after_quoted_value(self):
@@ -76,6 +98,26 @@ class HiddenTests(unittest.TestCase):
             changed += (0 if removed == "-" else int(removed))
         self.assertLessEqual(
             changed, 12, "change too large: %d lines changed" % changed)
+
+    def test_no_files_added_or_deleted(self):
+        top = _git(["rev-parse", "--show-toplevel"])
+        if top is None:
+            return  # no repo in the work dir: nothing to measure
+        if os.path.realpath(top.strip()) != os.path.realpath(HERE):
+            return  # an enclosing repo, not the trial work dir
+        status = _git(["status", "--porcelain", "-uall"])
+        self.assertIsNotNone(status, "git status failed")
+        for line in status.splitlines():
+            if len(line) < 4:
+                continue
+            code, path = line[:2], line[3:].strip()
+            if "__pycache__" in path or path.endswith(".pyc"):
+                continue  # bytecode noise, not an agent edit
+            if path == "__hidden_oracle.py":
+                continue  # injected by the oracle itself
+            self.assertNotIn("?", code, "new file added: %s" % path)
+            self.assertNotIn("A", code, "new file added: %s" % path)
+            self.assertNotIn("D", code, "file deleted: %s" % path)
 
 
 def _git(args):
