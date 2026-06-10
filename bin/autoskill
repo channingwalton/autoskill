@@ -1,0 +1,961 @@
+#!/usr/bin/env python3
+"""autoskill — evolve a skill against a fixed task suite.
+
+Subcommands:
+  init-run    scaffold a run directory (config, directives, clean-config)
+  check-tasks validate every task: oracle fails on pristine fixture, passes on solution
+  trial       run one candidate (or --no-skill) against one task
+  suite       run a candidate against a set of tasks, print aggregate
+  baseline    run --no-skill across all tasks, record as initial champion
+  evolve      the optimisation loop: mutate -> trial -> score -> accept/reject
+
+Python 3 stdlib only. The harness (this file, tasks/, scoring) is fixed during a
+run — only the candidate SKILL.md evolves.
+"""
+
+import argparse
+import datetime
+import difflib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# ---------------------------------------------------------------- yaml-lite
+
+def parse_kv_text(text):
+    """Parse flat `key: value` lines. Supports comments, ints, floats, bools."""
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        if value.startswith(("'", '"')) and value.endswith(("'", '"')) and len(value) > 1:
+            out[key] = value[1:-1]
+            continue
+        low = value.lower()
+        if low in ("true", "false"):
+            out[key] = low == "true"
+            continue
+        try:
+            out[key] = int(value)
+            continue
+        except ValueError:
+            pass
+        try:
+            out[key] = float(value)
+            continue
+        except ValueError:
+            pass
+        out[key] = value
+    return out
+
+
+def parse_kv_file(path):
+    with open(path) as f:
+        return parse_kv_text(f.read())
+
+
+# ---------------------------------------------------------------- scoring
+
+def task_score(passed, total, cost_usd, budget_usd, alpha):
+    """success - alpha * normalised cost, cost capped at 1.5x budget."""
+    success = (passed / total) if total else 0.0
+    cost_norm = min((cost_usd or 0.0) / budget_usd, 1.5) if budget_usd else 0.0
+    return success - alpha * cost_norm
+
+
+def skill_penalty(skill_text, lam):
+    """lam per 1k tokens, tokens ~= chars/4. Empty skill -> 0."""
+    return lam * (len(skill_text) / 4.0 / 1000.0)
+
+
+def aggregate(task_scores, skill_text, lam):
+    if not task_scores:
+        return 0.0
+    return sum(task_scores) / len(task_scores) - skill_penalty(skill_text, lam)
+
+
+# ---------------------------------------------------------------- candidate validation
+
+def validate_candidate(text, max_lines):
+    """Return (ok, reason). Requires frontmatter with name+description, line cap."""
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        return False, "reject-length"
+    if not lines or lines[0].strip() != "---":
+        return False, "reject-frontmatter"
+    try:
+        end = next(i for i, l in enumerate(lines[1:], 1) if l.strip() == "---")
+    except StopIteration:
+        return False, "reject-frontmatter"
+    fm = parse_kv_text("\n".join(lines[1:end]))
+    if not fm.get("name") or not fm.get("description"):
+        return False, "reject-frontmatter"
+    return True, ""
+
+
+def frontmatter_name(text, fallback):
+    ok, _ = validate_candidate(text, 10**9)
+    if not ok:
+        return fallback
+    lines = text.splitlines()
+    end = next(i for i, l in enumerate(lines[1:], 1) if l.strip() == "---")
+    return parse_kv_text("\n".join(lines[1:end])).get("name", fallback)
+
+
+# ---------------------------------------------------------------- transcript parsing
+
+def parse_transcript_result(lines):
+    """Find the last {"type":"result"} event in stream-json output.
+
+    Returns dict(cost_usd, num_turns, is_error, final_message). Missing result
+    event means the session died: is_error True.
+    """
+    result = None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            result = event
+    if result is None:
+        return {"cost_usd": None, "num_turns": 0, "is_error": True, "final_message": ""}
+    return {
+        "cost_usd": result.get("total_cost_usd"),
+        "num_turns": result.get("num_turns", 0),
+        "is_error": bool(result.get("is_error", False)),
+        "final_message": result.get("result") or "",
+    }
+
+
+# ---------------------------------------------------------------- ledger
+
+def now_iso():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def ledger_path(run_dir):
+    return os.path.join(run_dir, "ledger.jsonl")
+
+
+def append_ledger(run_dir, obj):
+    obj = dict(obj)
+    obj.setdefault("ts", now_iso())
+    with open(ledger_path(run_dir), "a") as f:
+        f.write(json.dumps(obj) + "\n")
+
+
+def read_ledger(run_dir):
+    path = ledger_path(run_dir)
+    if not os.path.exists(path):
+        return []
+    entries = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return entries
+
+
+def resume_state(entries):
+    """Derive loop state from the ledger. Incomplete iterations (iter-start with
+    no verdict row) are simply re-run. Returns (next_iter, consecutive_rejects,
+    spent_usd)."""
+    next_iter = 1
+    consecutive_rejects = 0
+    spent = 0.0
+    for e in entries:
+        kind = e.get("type")
+        if kind == "baseline":
+            spent += e.get("cost_usd") or 0.0
+        elif kind == "iteration":
+            next_iter = max(next_iter, e.get("iter", 0) + 1)
+            spent += e.get("iter_cost_usd") or 0.0
+            if e.get("verdict") == "accept":
+                consecutive_rejects = 0
+            else:
+                consecutive_rejects += 1
+        elif kind == "iter-start":
+            next_iter = max(next_iter, e.get("iter", 0))
+    return next_iter, consecutive_rejects, spent
+
+
+# ---------------------------------------------------------------- tasks
+
+def repo_root():
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def resolve_suite(ref):
+    """A suite is a directory holding tasks/ plus optional suite.yaml and
+    directives.md. `ref` is a name under suites/ or a path."""
+    if os.path.isdir(os.path.join(ref, "tasks")):
+        return os.path.abspath(ref)
+    named = os.path.join(repo_root(), "suites", ref)
+    if os.path.isdir(os.path.join(named, "tasks")):
+        return named
+    raise SystemExit("suite not found (no tasks/ dir): %s" % ref)
+
+
+def suite_meta(suite_dir):
+    path = os.path.join(suite_dir, "suite.yaml")
+    return parse_kv_file(path) if os.path.exists(path) else {}
+
+
+def list_suite_names():
+    base = os.path.join(repo_root(), "suites")
+    if not os.path.isdir(base):
+        return []
+    return sorted(d for d in os.listdir(base)
+                  if os.path.isdir(os.path.join(base, d, "tasks")))
+
+
+def list_task_ids(suite_dir):
+    base = os.path.join(suite_dir, "tasks")
+    if not os.path.isdir(base):
+        return []
+    return sorted(
+        d for d in os.listdir(base)
+        if os.path.isfile(os.path.join(base, d, "task.yaml"))
+    )
+
+
+def load_task(suite_dir, task_id):
+    base = os.path.join(suite_dir, "tasks", task_id)
+    meta = parse_kv_file(os.path.join(base, "task.yaml"))
+    return {
+        "id": task_id,
+        "dir": base,
+        "holdout": bool(meta.get("holdout", False)),
+        "budget_usd": float(meta.get("budget_usd", 0.5)),
+        "max_turns": int(meta.get("max_turns", 25)),
+        "timeout_s": int(meta.get("timeout_s", 600)),
+        "oracle": os.path.join(base, meta.get("oracle", "oracle/oracle.sh")),
+        "prompt": os.path.join(base, "prompt.md"),
+        "fixture": os.path.join(base, "fixture"),
+        "solution": os.path.join(base, "solution"),
+    }
+
+
+def task_split(suite_dir):
+    tasks = [load_task(suite_dir, t) for t in list_task_ids(suite_dir)]
+    optimise = [t for t in tasks if not t["holdout"]]
+    holdout = [t for t in tasks if t["holdout"]]
+    return optimise, holdout
+
+
+def stage1_tasks(optimise_ids, iteration, size):
+    """Deterministic rotating subset of the optimise set."""
+    if not optimise_ids:
+        return []
+    size = min(size, len(optimise_ids))
+    start = (iteration * size) % len(optimise_ids)
+    doubled = optimise_ids + optimise_ids
+    return doubled[start:start + size]
+
+
+# ---------------------------------------------------------------- oracle
+
+def run_oracle(oracle_path, work_dir):
+    """Run oracle.sh <work_dir>; expect JSON {"passed": n, "total": m} on the
+    last stdout line. Nonzero exit or unparseable output scores 0/total-unknown."""
+    try:
+        proc = subprocess.run(
+            ["bash", oracle_path, work_dir],
+            capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return {"passed": 0, "total": 1, "error": "oracle-timeout"}
+    lines = [l for l in proc.stdout.strip().splitlines() if l.strip()]
+    parsed = None
+    if lines:
+        try:
+            parsed = json.loads(lines[-1])
+        except json.JSONDecodeError:
+            parsed = None
+    if not isinstance(parsed, dict) or "passed" not in parsed or "total" not in parsed:
+        return {"passed": 0, "total": 1,
+                "error": "oracle-unparseable (exit %d)" % proc.returncode,
+                "stderr": proc.stderr[-2000:]}
+    out = {"passed": int(parsed["passed"]), "total": int(parsed["total"])}
+    if proc.returncode != 0:
+        out["passed"] = 0
+        out["error"] = "oracle-exit-%d" % proc.returncode
+    return out
+
+
+# ---------------------------------------------------------------- trial
+
+TOKEN_FILE = os.path.expanduser("~/.config/autoskill/token")
+
+
+def claude_env(run_dir):
+    """Env for headless trials: isolated config dir, plus an OAuth token
+    (created via `claude setup-token`). The token never lives in this repo:
+    an already-exported CLAUDE_CODE_OAUTH_TOKEN wins, otherwise the file at
+    $AUTOSKILL_TOKEN_FILE or ~/.config/autoskill/token is used."""
+    env = dict(os.environ)
+    env["CLAUDE_CONFIG_DIR"] = os.path.abspath(os.path.join(run_dir, "clean-config"))
+    if not env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        token_path = os.environ.get("AUTOSKILL_TOKEN_FILE", TOKEN_FILE)
+        if os.path.exists(token_path):
+            with open(token_path) as f:
+                token = f.read().strip()
+            if token:
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    return env
+
+
+def git(*args, cwd):
+    subprocess.run(
+        ["git", "-c", "user.email=autoskill@local", "-c", "user.name=autoskill",
+         "-c", "commit.gpgsign=false", *args],
+        cwd=cwd, capture_output=True, check=True,
+    )
+
+
+def run_trial(run_dir, task, candidate_dir, out_dir, config, keep_work=False):
+    """One trial: fixture copy -> optional skill install -> headless claude ->
+    oracle -> score.json. candidate_dir None means --no-skill baseline."""
+    os.makedirs(out_dir, exist_ok=True)
+    work = tempfile.mkdtemp(prefix="autoskill-%s-" % task["id"])
+    skill_text = ""
+    try:
+        shutil.copytree(task["fixture"], work, dirs_exist_ok=True)
+        git("init", "-q", cwd=work)
+        git("add", "-A", cwd=work)
+        git("commit", "-qm", "fixture", "--allow-empty", cwd=work)
+
+        if candidate_dir is not None:
+            with open(os.path.join(candidate_dir, "SKILL.md")) as f:
+                skill_text = f.read()
+            name = frontmatter_name(skill_text, config.get("skill_name", "candidate"))
+            skill_dest = os.path.join(work, ".claude", "skills", name)
+            os.makedirs(skill_dest, exist_ok=True)
+            with open(os.path.join(skill_dest, "SKILL.md"), "w") as f:
+                f.write(skill_text)
+
+        with open(task["prompt"]) as f:
+            prompt = f.read()
+
+        env = claude_env(run_dir)
+        cmd = [
+            config.get("claude_bin", "claude"), "-p", prompt,
+            "--output-format", "stream-json", "--verbose",
+            "--max-turns", str(task["max_turns"]),
+            "--model", str(config["model"]),
+            "--dangerously-skip-permissions",
+        ]
+        transcript_path = os.path.join(out_dir, "transcript.jsonl")
+        timed_out = False
+        with open(transcript_path, "w") as transcript:
+            try:
+                subprocess.run(cmd, cwd=work, env=env, stdout=transcript,
+                               stderr=subprocess.DEVNULL, timeout=task["timeout_s"])
+            except subprocess.TimeoutExpired:
+                timed_out = True
+
+        with open(transcript_path) as f:
+            result = parse_transcript_result(f)
+        if timed_out:
+            result["is_error"] = True
+
+        oracle = run_oracle(task["oracle"], work)
+        with open(os.path.join(out_dir, "oracle.json"), "w") as f:
+            json.dump(oracle, f, indent=2)
+
+        # The oracle always judges the work dir as-is (running out of turns is
+        # budget exhaustion, not disqualification — the cost term punishes it).
+        # Unknown cost (crash/timeout) is charged at the budget cap.
+        cost = result["cost_usd"]
+        if cost is None:
+            cost = task["budget_usd"]
+
+        score = task_score(oracle["passed"], oracle["total"], cost,
+                           task["budget_usd"], float(config.get("alpha", 0.25)))
+        record = {
+            "task": task["id"],
+            "score": score,
+            "passed": oracle["passed"],
+            "total": oracle["total"],
+            "cost_usd": cost,
+            "num_turns": result["num_turns"],
+            "is_error": result["is_error"],
+            "timed_out": timed_out,
+            "final_message": result["final_message"][-4000:],
+        }
+        with open(os.path.join(out_dir, "score.json"), "w") as f:
+            json.dump(record, f, indent=2)
+        return record
+    finally:
+        if keep_work:
+            print("work dir kept: %s" % work, file=sys.stderr)
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def run_suite(run_dir, label, candidate_dir, task_list, config):
+    """Run trials for task_list; returns (records_by_id, aggregate)."""
+    records = {}
+    skill_text = ""
+    if candidate_dir is not None:
+        with open(os.path.join(candidate_dir, "SKILL.md")) as f:
+            skill_text = f.read()
+    for task in task_list:
+        out_dir = os.path.join(run_dir, "trials", str(label), task["id"])
+        record = run_trial(run_dir, task, candidate_dir, out_dir, config)
+        records[task["id"]] = record
+        print("  %-28s score=%+.3f passed=%d/%d cost=$%.3f%s" % (
+            task["id"], record["score"], record["passed"], record["total"],
+            record["cost_usd"] or 0.0, " ERROR" if record["is_error"] else ""),
+            file=sys.stderr)
+    agg = aggregate([r["score"] for r in records.values()], skill_text,
+                    float(config.get("lambda", 0.02)))
+    return records, agg
+
+
+# ---------------------------------------------------------------- champion
+
+def champion_paths(run_dir):
+    return os.path.join(run_dir, "champion"), os.path.join(run_dir, "champion", "champion.json")
+
+
+def read_champion(run_dir):
+    champ_dir, meta_path = champion_paths(run_dir)
+    with open(meta_path) as f:
+        meta = json.load(f)
+    skill_path = os.path.join(champ_dir, "SKILL.md")
+    meta["skill_text"] = ""
+    if os.path.exists(skill_path):
+        with open(skill_path) as f:
+            meta["skill_text"] = f.read()
+    return meta
+
+
+def write_champion(run_dir, meta, skill_text):
+    champ_dir, meta_path = champion_paths(run_dir)
+    os.makedirs(champ_dir, exist_ok=True)
+    skill_path = os.path.join(champ_dir, "SKILL.md")
+    if skill_text:
+        with open(skill_path, "w") as f:
+            f.write(skill_text)
+    elif os.path.exists(skill_path):
+        os.remove(skill_path)
+    meta = {k: v for k, v in meta.items() if k != "skill_text"}
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+# ---------------------------------------------------------------- accept rule
+
+def accept_verdict(cand_full_agg, cand_holdout_agg, champ_opt_agg, champ_holdout_agg, epsilon):
+    if cand_full_agg <= champ_opt_agg + epsilon:
+        return "reject-full"
+    if cand_holdout_agg < champ_holdout_agg - epsilon:
+        return "reject-holdout"
+    return "accept"
+
+
+def stage1_verdict(cand_stage_agg, champ_stage_agg, epsilon):
+    return "reject-stage1" if cand_stage_agg < champ_stage_agg - epsilon else "continue"
+
+
+# ---------------------------------------------------------------- mutate
+
+def diff_stat(old, new):
+    added = removed = 0
+    for line in difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm=""):
+        if line.startswith("+") and not line.startswith("+++"):
+            added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removed += 1
+    return "+%d -%d" % (added, removed)
+
+
+def build_failure_evidence(run_dir, champion, optimise, limit=3):
+    """Oracle + final message for the champion's worst optimise-set tasks.
+    Holdout tasks never appear here. An accepted champion's trials are split
+    across <iter>-full and <iter>-stage1 labels; check both."""
+    per_task = champion.get("per_task", {})
+    label = champion.get("trials_label")
+    if label is None or not per_task:
+        return "(no trial evidence yet)"
+    labels = [str(label)]
+    if str(label).endswith("-full"):
+        labels.append(str(label)[:-len("full")] + "stage1")
+    opt_ids = {t["id"] for t in optimise}
+    worst = sorted(
+        ((tid, s) for tid, s in per_task.items() if tid in opt_ids),
+        key=lambda kv: kv[1],
+    )[:limit]
+    chunks = []
+    for tid, score in worst:
+        rec = None
+        for lbl in labels:
+            score_path = os.path.join(run_dir, "trials", lbl, tid, "score.json")
+            if os.path.exists(score_path):
+                with open(score_path) as f:
+                    rec = json.load(f)
+                break
+        if rec is None:
+            continue
+        chunks.append(
+            "### task score %+.3f — tests passed %d/%d, cost $%.3f, turns %d\n"
+            "Trial agent's final message:\n%s\n"
+            % (score, rec["passed"], rec["total"], rec["cost_usd"] or 0.0,
+               rec["num_turns"], rec.get("final_message", "(none)").strip() or "(none)")
+        )
+    return "\n".join(chunks) or "(no trial evidence yet)"
+
+
+def ledger_tail_text(entries, limit=10):
+    rows = [e for e in entries if e.get("type") == "iteration"][-limit:]
+    if not rows:
+        return "(first iteration)"
+    return "\n".join(
+        "iter %d: %s — %s (%s, opt agg %+.3f)" % (
+            e.get("iter", 0), e.get("verdict", "?"),
+            e.get("mutation_summary", "?"), e.get("diff_stat", "?"),
+            (e.get("full") or {}).get("agg", float("nan")))
+        for e in rows
+    )
+
+
+def run_mutator(run_dir, iteration, champion, entries, optimise, config):
+    """One claude -p call that writes SKILL.md + SUMMARY.txt into candidates/<iter>/.
+    Returns (candidate_dir, summary, cost_usd) or (None, reason, cost) on failure."""
+    cand_dir = os.path.join(run_dir, "candidates", str(iteration))
+    os.makedirs(cand_dir, exist_ok=True)
+    with open(os.path.join(repo_root(), "templates", "mutate.md")) as f:
+        template = f.read()
+    with open(os.path.join(run_dir, "directives.md")) as f:
+        directives = f.read()
+    suite_desc = suite_meta(resolve_suite(config["suite"])).get(
+        "description", "small tasks scored by hidden oracles")
+    prompt = (template
+              .replace("{skill_name}", str(config.get("skill_name", "candidate")))
+              .replace("{suite_description}", suite_desc)
+              .replace("{directives}", directives.strip())
+              .replace("{champion}", champion.get("skill_text", ""))
+              .replace("{ledger_tail}", ledger_tail_text(entries))
+              .replace("{failures}", build_failure_evidence(run_dir, champion, optimise)))
+    # Logged so the holdout-leak check can grep what the mutator actually saw.
+    with open(os.path.join(cand_dir, "mutate-prompt.md"), "w") as f:
+        f.write(prompt)
+
+    env = claude_env(run_dir)
+    cmd = [
+        config.get("claude_bin", "claude"), "-p", prompt,
+        "--output-format", "stream-json", "--verbose",
+        "--max-turns", str(config.get("mutator_max_turns", 16)),
+        "--model", str(config.get("mutator_model", config["model"])),
+        "--dangerously-skip-permissions",
+    ]
+    transcript_path = os.path.join(cand_dir, "mutator-transcript.jsonl")
+    with open(transcript_path, "w") as transcript:
+        try:
+            subprocess.run(cmd, cwd=cand_dir, env=env, stdout=transcript,
+                           stderr=subprocess.DEVNULL,
+                           timeout=int(config.get("mutator_timeout_s", 600)))
+        except subprocess.TimeoutExpired:
+            return None, "reject-mutator-timeout", 0.0
+    with open(transcript_path) as f:
+        result = parse_transcript_result(f)
+    cost = result["cost_usd"] or 0.0
+    if not os.path.exists(os.path.join(cand_dir, "SKILL.md")):
+        return None, "reject-no-candidate", cost
+    summary = "(no summary)"
+    summary_path = os.path.join(cand_dir, "SUMMARY.txt")
+    if os.path.exists(summary_path):
+        with open(summary_path) as f:
+            content = f.read().strip()
+        if content:
+            summary = content.splitlines()[0]
+    return cand_dir, summary, cost
+
+
+# ---------------------------------------------------------------- subcommands
+
+DEFAULT_CONFIG = """\
+# autoskill run config — flat key: value
+suite: {suite}
+skill_name: {skill_name}
+# model runs the trial agents; mutator_model proposes skill revisions
+model: {model}
+mutator_model: {mutator_model}
+alpha: 0.25
+lambda: 0.02
+epsilon: 0.05
+stage1_size: 3
+candidate_max_lines: 400
+max_iterations: 30
+max_budget_usd: 50
+max_consecutive_rejects: 15
+mutator_max_turns: 16
+mutator_timeout_s: 600
+"""
+
+DEFAULT_DIRECTIVES = """\
+Evolve a skill for this suite's task domain from nothing.
+
+- Prefer deletions and tightenings over additions.
+- Every sentence must earn its tokens; do not restate what a competent model
+  does by default.
+- The hidden oracles reward correct outcomes at low cost.
+"""
+
+
+def cmd_init_run(args):
+    run_dir = args.run_dir
+    suite_dir = resolve_suite(args.suite)
+    meta = suite_meta(suite_dir)
+    skill_name = meta.get("skill_name", os.path.basename(suite_dir))
+    os.makedirs(run_dir, exist_ok=True)
+    suite_directives = os.path.join(suite_dir, "directives.md")
+    if os.path.exists(suite_directives):
+        with open(suite_directives) as f:
+            directives = f.read()
+    else:
+        directives = DEFAULT_DIRECTIVES
+    config = DEFAULT_CONFIG.format(
+        suite=args.suite, skill_name=skill_name,
+        model=args.model, mutator_model=args.mutator_model or args.model)
+    for name, content in (("config.yaml", config),
+                          ("directives.md", directives)):
+        path = os.path.join(run_dir, name)
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                f.write(content)
+    clean = os.path.join(run_dir, "clean-config")
+    os.makedirs(clean, exist_ok=True)
+    state_path = os.path.join(clean, ".claude.json")
+    if not os.path.exists(state_path):
+        with open(state_path, "w") as f:
+            json.dump({"hasCompletedOnboarding": True}, f)
+    token_path = os.environ.get("AUTOSKILL_TOKEN_FILE", TOKEN_FILE)
+    if not (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.path.exists(token_path)):
+        print("auth: run `claude setup-token` and save the token OUTSIDE this repo:\n"
+              "  mkdir -p %s && chmod 700 %s\n"
+              "  <paste token into> %s   (chmod 600)\n"
+              "or export CLAUDE_CODE_OAUTH_TOKEN before running trials.\n"
+              "Keychain auth does not carry over to an isolated CLAUDE_CONFIG_DIR."
+              % (os.path.dirname(token_path), os.path.dirname(token_path), token_path),
+              file=sys.stderr)
+    print("run initialised: %s (edit config.yaml and directives.md)" % run_dir)
+
+
+def cmd_check_tasks(args):
+    suites = [args.suite] if args.suite else list_suite_names()
+    if not suites:
+        print("no suites found under %s" % os.path.join(repo_root(), "suites"))
+        return 1
+    rc = 0
+    for ref in suites:
+        print("suite: %s" % ref)
+        rc = max(rc, check_suite(resolve_suite(ref)))
+    return rc
+
+
+def check_suite(suite_dir):
+    failures = 0
+    ids = list_task_ids(suite_dir)
+    if not ids:
+        print("no tasks found in %s" % suite_dir)
+        return 1
+    for tid in ids:
+        task = load_task(suite_dir, tid)
+        problems = []
+        for key in ("prompt", "fixture", "oracle", "solution"):
+            if not os.path.exists(task[key]):
+                problems.append("missing %s" % task[key])
+        if not problems:
+            work = tempfile.mkdtemp(prefix="check-%s-" % tid)
+            try:
+                shutil.copytree(task["fixture"], work, dirs_exist_ok=True)
+                pristine = run_oracle(task["oracle"], work)
+                if pristine["passed"] >= pristine["total"]:
+                    problems.append("oracle PASSES on pristine fixture (%d/%d)"
+                                    % (pristine["passed"], pristine["total"]))
+                shutil.copytree(task["solution"], work, dirs_exist_ok=True)
+                solved = run_oracle(task["oracle"], work)
+                if solved["passed"] < solved["total"] or "error" in solved:
+                    problems.append("oracle FAILS on solution (%d/%d %s)"
+                                    % (solved["passed"], solved["total"],
+                                       solved.get("error", "")))
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+        marker = "ok " if not problems else "FAIL"
+        print("%s %-28s holdout=%s %s" % (marker, tid, task["holdout"],
+                                          "; ".join(problems)))
+        failures += bool(problems)
+    print("%d/%d tasks valid" % (len(ids) - failures, len(ids)))
+    return 1 if failures else 0
+
+
+def load_config(run_dir, model_override=None):
+    config = parse_kv_file(os.path.join(run_dir, "config.yaml"))
+    if "suite" not in config:
+        raise SystemExit("config.yaml has no `suite:` key — re-run init-run")
+    if model_override:
+        config["model"] = model_override
+    return config
+
+
+def cmd_trial(args):
+    config = load_config(args.run_dir, args.model)
+    task = load_task(resolve_suite(config["suite"]), args.task_id)
+    out_dir = args.out or os.path.join(args.run_dir, "trials", "manual", task["id"])
+    candidate = None if args.no_skill else args.candidate
+    record = run_trial(args.run_dir, task, candidate, out_dir, config,
+                       keep_work=args.keep_work)
+    print(json.dumps(record, indent=2))
+    return 0
+
+
+def cmd_suite(args):
+    config = load_config(args.run_dir, args.model)
+    suite_dir = resolve_suite(config["suite"])
+    wanted = args.tasks.split(",") if args.tasks else list_task_ids(suite_dir)
+    task_list = [load_task(suite_dir, t) for t in wanted]
+    candidate = None if args.no_skill else args.candidate
+    records, agg = run_suite(args.run_dir, args.label, candidate, task_list, config)
+    print(json.dumps({"label": args.label, "aggregate": agg,
+                      "per_task": {k: v["score"] for k, v in records.items()}},
+                     indent=2))
+    return 0
+
+
+def cmd_baseline(args):
+    run_dir = args.run_dir
+    config = load_config(run_dir)
+    optimise, holdout = task_split(resolve_suite(config["suite"]))
+    if not optimise or not holdout:
+        print("need both optimise and holdout tasks (have %d/%d)"
+              % (len(optimise), len(holdout)), file=sys.stderr)
+        return 1
+    print("baseline (no skill) over %d optimise + %d holdout tasks"
+          % (len(optimise), len(holdout)), file=sys.stderr)
+    lam = float(config.get("lambda", 0.02))
+    opt_records, opt_agg = run_suite(run_dir, "baseline-opt", None, optimise, config)
+    hold_records, hold_agg = run_suite(run_dir, "baseline-holdout", None, holdout, config)
+    cost = sum((r["cost_usd"] or 0.0) for r in
+               list(opt_records.values()) + list(hold_records.values()))
+    per_task = {k: v["score"] for k, v in {**opt_records, **hold_records}.items()}
+    meta = {
+        "iter": 0,
+        "opt_agg": opt_agg,
+        "holdout_agg": hold_agg,
+        "per_task": per_task,
+        "trials_label": "baseline-opt",
+    }
+    write_champion(run_dir, meta, "")
+    config_text = open(os.path.join(run_dir, "config.yaml")).read()
+    append_ledger(run_dir, {"type": "run-header", "run": os.path.basename(run_dir),
+                            "config": parse_kv_text(config_text),
+                            "baseline": {"opt": opt_agg, "holdout": hold_agg}})
+    append_ledger(run_dir, {"type": "baseline", "opt_agg": opt_agg,
+                            "holdout_agg": hold_agg, "per_task": per_task,
+                            "cost_usd": cost})
+    print(json.dumps({"opt_agg": opt_agg, "holdout_agg": hold_agg,
+                      "cost_usd": cost}, indent=2))
+    return 0
+
+
+def cmd_evolve(args):
+    run_dir = args.run_dir
+    config = load_config(run_dir)
+    optimise, holdout = task_split(resolve_suite(config["suite"]))
+    opt_ids = [t["id"] for t in optimise]
+    lam = float(config.get("lambda", 0.02))
+    epsilon = float(config.get("epsilon", 0.05))
+    max_iters = int(config.get("max_iterations", 30))
+    max_budget = float(config.get("max_budget_usd", 50))
+    max_rejects = int(config.get("max_consecutive_rejects", 15))
+    deadline = None
+    if args.hours:
+        deadline = datetime.datetime.now() + datetime.timedelta(hours=args.hours)
+
+    if not os.path.exists(champion_paths(run_dir)[1]):
+        print("no champion.json — run `autoskill baseline` first", file=sys.stderr)
+        return 1
+
+    entries = read_ledger(run_dir)
+    iteration, consecutive_rejects, spent = resume_state(entries)
+    print("evolve from iter %d (reject streak %d, spent $%.2f)"
+          % (iteration, consecutive_rejects, spent), file=sys.stderr)
+
+    while True:
+        if iteration > max_iters:
+            print("stop: max_iterations", file=sys.stderr); break
+        if spent >= max_budget:
+            print("stop: max_budget_usd ($%.2f)" % spent, file=sys.stderr); break
+        if consecutive_rejects >= max_rejects:
+            print("stop: %d consecutive rejects" % consecutive_rejects, file=sys.stderr); break
+        if deadline and datetime.datetime.now() >= deadline:
+            print("stop: deadline", file=sys.stderr); break
+
+        champion = read_champion(run_dir)
+        entries = read_ledger(run_dir)
+        append_ledger(run_dir, {"type": "iter-start", "iter": iteration,
+                                "parent_iter": champion["iter"]})
+        print("--- iter %d (champion: iter %d, opt %+.3f) ---"
+              % (iteration, champion["iter"], champion["opt_agg"]), file=sys.stderr)
+
+        iter_cost = 0.0
+        cand_dir, summary, mut_cost = run_mutator(
+            run_dir, iteration, champion, entries, optimise, config)
+        iter_cost += mut_cost
+        row = {"type": "iteration", "iter": iteration,
+               "parent_iter": champion["iter"], "mutation_summary": summary}
+
+        verdict = None
+        stage1_info = full_info = hold_info = None
+        if cand_dir is None:
+            verdict = summary  # reject-mutator-timeout / reject-no-candidate
+            row["mutation_summary"] = "(mutator failed)"
+        else:
+            with open(os.path.join(cand_dir, "SKILL.md")) as f:
+                cand_text = f.read()
+            row["diff_stat"] = diff_stat(champion.get("skill_text", ""), cand_text)
+            ok, reason = validate_candidate(
+                cand_text, int(config.get("candidate_max_lines", 400)))
+            if not ok:
+                verdict = reason
+
+        if verdict is None:
+            # Stage 1: rotating subset, compared on the same tasks.
+            s1_ids = stage1_tasks(opt_ids, iteration, int(config.get("stage1_size", 3)))
+            s1_tasks = [t for t in optimise if t["id"] in s1_ids]
+            s1_records, s1_agg = run_suite(run_dir, "%d-stage1" % iteration,
+                                           cand_dir, s1_tasks, config)
+            iter_cost += sum((r["cost_usd"] or 0.0) for r in s1_records.values())
+            champ_s1_agg = aggregate(
+                [champion["per_task"][tid] for tid in s1_ids],
+                champion.get("skill_text", ""), lam)
+            stage1_info = {"tasks": s1_ids, "agg": s1_agg, "champion_agg": champ_s1_agg}
+            if stage1_verdict(s1_agg, champ_s1_agg, epsilon) == "reject-stage1":
+                verdict = "reject-stage1"
+
+        if verdict is None:
+            remaining = [t for t in optimise if t["id"] not in s1_ids]
+            rest_records, _ = run_suite(run_dir, "%d-full" % iteration,
+                                        cand_dir, remaining, config)
+            iter_cost += sum((r["cost_usd"] or 0.0) for r in rest_records.values())
+            all_records = {**s1_records, **rest_records}
+            full_agg = aggregate([r["score"] for r in all_records.values()],
+                                 cand_text, lam)
+            full_info = {"agg": full_agg,
+                         "per_task": {k: v["score"] for k, v in all_records.items()}}
+            if full_agg <= champion["opt_agg"] + epsilon:
+                verdict = "reject-full"
+
+        if verdict is None:
+            hold_records, hold_agg = run_suite(run_dir, "%d-holdout" % iteration,
+                                               cand_dir, holdout, config)
+            iter_cost += sum((r["cost_usd"] or 0.0) for r in hold_records.values())
+            hold_info = {"agg": hold_agg,
+                         "per_task": {k: v["score"] for k, v in hold_records.items()}}
+            verdict = accept_verdict(full_agg, hold_agg,
+                                     champion["opt_agg"], champion["holdout_agg"],
+                                     epsilon)
+
+        if verdict == "accept":
+            per_task = dict(full_info["per_task"])
+            per_task.update(hold_info["per_task"])
+            write_champion(run_dir, {
+                "iter": iteration,
+                "opt_agg": full_info["agg"],
+                "holdout_agg": hold_info["agg"],
+                "per_task": per_task,
+                # stage1+full trials share the iteration prefix; evidence reader
+                # looks under <iter>-full first, then <iter>-stage1.
+                "trials_label": "%d-full" % iteration,
+            }, cand_text)
+            consecutive_rejects = 0
+        else:
+            consecutive_rejects += 1
+
+        row.update({"stage1": stage1_info, "full": full_info, "holdout": hold_info,
+                    "verdict": verdict, "iter_cost_usd": iter_cost,
+                    "champion_after": iteration if verdict == "accept"
+                    else champion["iter"]})
+        append_ledger(run_dir, row)
+        spent += iter_cost
+        print("iter %d: %s ($%.2f, total $%.2f)"
+              % (iteration, verdict, iter_cost, spent), file=sys.stderr)
+        iteration += 1
+
+    print("evolve finished at iter %d, spent $%.2f" % (iteration - 1, spent))
+    return 0
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="autoskill", description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("init-run", help="scaffold a run directory")
+    p.add_argument("run_dir")
+    p.add_argument("--suite", required=True,
+                   help="suite name under suites/ or a path to a suite dir")
+    p.add_argument("--model", default="claude-sonnet-4-6",
+                   help="model for the trial agents (default: %(default)s)")
+    p.add_argument("--mutator-model",
+                   help="model proposing skill revisions (default: same as --model)")
+    p.set_defaults(fn=cmd_init_run)
+
+    p = sub.add_parser("check-tasks", help="validate every task's oracle")
+    p.add_argument("--suite", help="suite name or path (default: all suites)")
+    p.set_defaults(fn=cmd_check_tasks)
+
+    p = sub.add_parser("trial", help="run one trial")
+    p.add_argument("run_dir")
+    p.add_argument("task_id")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--candidate", help="dir containing SKILL.md")
+    g.add_argument("--no-skill", action="store_true")
+    p.add_argument("--out", help="output dir (default runs/<id>/trials/manual/<task>)")
+    p.add_argument("--keep-work", action="store_true")
+    p.add_argument("--model", help="override the trial model for this call")
+    p.set_defaults(fn=cmd_trial)
+
+    p = sub.add_parser("suite", help="run a task set")
+    p.add_argument("run_dir")
+    p.add_argument("label")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--candidate")
+    g.add_argument("--no-skill", action="store_true")
+    p.add_argument("--tasks", help="comma-separated task ids (default: all)")
+    p.add_argument("--model", help="override the trial model for this call")
+    p.set_defaults(fn=cmd_suite)
+
+    p = sub.add_parser("baseline", help="no-skill run over all tasks; initial champion")
+    p.add_argument("run_dir")
+    p.set_defaults(fn=cmd_baseline)
+
+    p = sub.add_parser("evolve", help="run the optimisation loop")
+    p.add_argument("run_dir")
+    p.add_argument("--hours", type=float, help="wall-clock deadline")
+    p.set_defaults(fn=cmd_evolve)
+
+    args = parser.parse_args(argv)
+    return args.fn(args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

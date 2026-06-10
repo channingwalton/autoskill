@@ -1,0 +1,6 @@
+id: ambiguous-spec-discounts
+holdout: false
+budget_usd: 0.50
+max_turns: 25
+timeout_s: 600
+oracle: oracle/oracle.sh

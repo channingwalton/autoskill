@@ -1,0 +1,6 @@
+id: legacy-characterise-tax
+holdout: false
+budget_usd: 0.75
+max_turns: 50
+timeout_s: 900
+oracle: oracle/oracle.sh

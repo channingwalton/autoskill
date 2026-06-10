@@ -1,0 +1,1 @@
+Implement `apply_discount` in `discounts.py` according to the spec in `README.md`. The spec is the source of truth — read it carefully, every sentence matters. The tests in `test_discounts.py` cover the basics and must pass, but they don't cover everything the spec requires, so make sure your implementation matches the spec exactly, edge cases included.
