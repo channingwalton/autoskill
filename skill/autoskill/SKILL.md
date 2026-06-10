@@ -45,9 +45,14 @@ All commands run from the repo root `~/dev/autoskill`.
 3. Auth: the isolated `CLAUDE_CONFIG_DIR` cannot see Keychain credentials.
    Have the user run `claude setup-token` and save the token to
    `~/.config/autoskill/token` (chmod 600) — never anywhere under the repo.
-4. Smoke check: one cheap trial —
+   Local serving instead: set `base_url` (+ `alpha: 0`, `timeout_multiplier`)
+   — no token at all, spend records as $0.
+4. Sandbox: `docker build -t autoskill-trial docker/`, set `docker_image` in
+   config.yaml. Agents then run caged with only their work dir mounted.
+   Skipping this means trial agents run unsandboxed on the host.
+5. Smoke check: one cheap trial —
    `bin/autoskill trial runs/<name> <some-task> --no-skill` — and confirm the
-   score JSON has a real `cost_usd` and no `is_error`.
+   score JSON has no `is_error` (and a real `cost_usd` when on the API).
 
 ## 📏 BASELINE
 

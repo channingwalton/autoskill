@@ -299,6 +299,32 @@ class TestClaudeEnv(unittest.TestCase):
             self.assertNotIn("ANTHROPIC_BASE_URL", env)
 
 
+class TestDockerCmd(unittest.TestCase):
+    CONFIG = {"docker_image": "autoskill-trial",
+              "base_url": "http://127.0.0.1:8080"}
+
+    def test_rewrites_loopback_for_container(self):
+        self.assertEqual(a.container_base_url("http://127.0.0.1:8080"),
+                         "http://host.docker.internal:8080")
+        self.assertEqual(a.container_base_url("http://localhost:1234/v1"),
+                         "http://host.docker.internal:1234/v1")
+
+    def test_mounts_only_work_dir(self):
+        with tempfile.TemporaryDirectory() as work:
+            env = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8080",
+                   "ANTHROPIC_AUTH_TOKEN": "local"}
+            cmd = a.docker_cmd(self.CONFIG, work, env, ["claude", "-p", "x"],
+                               "autoskill-test")
+            mounts = [cmd[i + 1] for i, t in enumerate(cmd) if t == "-v"]
+            self.assertEqual(mounts, [os.path.realpath(work) + ":/work"])
+            joined = " ".join(cmd)
+            self.assertIn("ANTHROPIC_BASE_URL=http://host.docker.internal:8080",
+                          joined)
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", joined)
+            # image then the claude args, nothing after
+            self.assertEqual(cmd[-4:], ["autoskill-trial", "claude", "-p", "x"])
+
+
 class TestWaitForCapacity(unittest.TestCase):
     CONFIG = {"limit_poll_minutes": 15, "limit_max_wait_hours": 1, "model": "m"}
 

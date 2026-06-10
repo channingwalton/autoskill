@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 # ---------------------------------------------------------------- yaml-lite
 
@@ -415,6 +416,38 @@ def claude_env(run_dir, config=None):
     return env
 
 
+def container_base_url(base_url):
+    """Inside a container the host's loopback lives at host.docker.internal."""
+    return re.sub(r"127\.0\.0\.1|localhost", "host.docker.internal",
+                  str(base_url))
+
+
+def docker_cmd(config, work, env, claude_args, name):
+    """Wrap a claude invocation in a throwaway container. Only the work dir
+    is mounted; host filesystem, credentials and config are invisible. The
+    image carries its own claude binary and an ephemeral CLAUDE_CONFIG_DIR."""
+    cmd = ["docker", "run", "--rm", "--name", name,
+           "--memory", str(config.get("docker_memory", "4g")),
+           "--cpus", str(config.get("docker_cpus", "4")),
+           "--pids-limit", "1024",
+           "--add-host", "host.docker.internal:host-gateway",
+           "-v", os.path.realpath(work) + ":/work",
+           "-w", "/work"]
+    for var in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN"):
+        val = env.get(var)
+        if val:
+            if var == "ANTHROPIC_BASE_URL":
+                val = container_base_url(val)
+            cmd += ["-e", "%s=%s" % (var, val)]
+    cmd.append(str(config["docker_image"]))
+    return cmd + claude_args
+
+
+def docker_kill(name):
+    subprocess.run(["docker", "kill", name], capture_output=True)
+
+
 def git(*args, cwd):
     subprocess.run(
         ["git", "-c", "user.email=autoskill@local", "-c", "user.name=autoskill",
@@ -448,13 +481,20 @@ def run_trial(run_dir, task, candidate_dir, out_dir, config, keep_work=False):
             prompt = f.read()
 
         env = claude_env(run_dir, config)
-        cmd = [
+        claude_args = [
             config.get("claude_bin", "claude"), "-p", prompt,
             "--output-format", "stream-json", "--verbose",
             "--max-turns", str(task["max_turns"]),
             "--model", str(config["model"]),
             "--dangerously-skip-permissions",
         ]
+        container = None
+        if config.get("docker_image"):
+            container = "autoskill-%s" % uuid.uuid4().hex[:12]
+            claude_args[0] = "claude"  # the image's own binary
+            cmd = docker_cmd(config, work, env, claude_args, container)
+        else:
+            cmd = claude_args
         transcript_path = os.path.join(out_dir, "transcript.jsonl")
         timed_out = False
         timeout_s = int(task["timeout_s"] * float(config.get("timeout_multiplier", 1)))
@@ -464,6 +504,9 @@ def run_trial(run_dir, task, candidate_dir, out_dir, config, keep_work=False):
                                stderr=subprocess.DEVNULL, timeout=timeout_s)
             except subprocess.TimeoutExpired:
                 timed_out = True
+                if container:
+                    # killing the docker client does not kill the container
+                    docker_kill(container)
 
         with open(transcript_path) as f:
             result = parse_transcript_result(f)
@@ -714,13 +757,20 @@ def _run_mutator_once(run_dir, iteration, champion, entries, optimise, config):
         f.write(prompt)
 
     env = claude_env(run_dir, config)
-    cmd = [
+    claude_args = [
         config.get("claude_bin", "claude"), "-p", prompt,
         "--output-format", "stream-json", "--verbose",
         "--max-turns", str(config.get("mutator_max_turns", 16)),
         "--model", str(config.get("mutator_model", config["model"])),
         "--dangerously-skip-permissions",
     ]
+    container = None
+    if config.get("docker_image"):
+        container = "autoskill-%s" % uuid.uuid4().hex[:12]
+        claude_args[0] = "claude"
+        cmd = docker_cmd(config, cand_dir, env, claude_args, container)
+    else:
+        cmd = claude_args
     transcript_path = os.path.join(cand_dir, "mutator-transcript.jsonl")
     with open(transcript_path, "w") as transcript:
         try:
@@ -728,6 +778,8 @@ def _run_mutator_once(run_dir, iteration, champion, entries, optimise, config):
                            stderr=subprocess.DEVNULL,
                            timeout=int(config.get("mutator_timeout_s", 600)))
         except subprocess.TimeoutExpired:
+            if container:
+                docker_kill(container)
             return None, "reject-mutator-timeout", 0.0, None
     with open(transcript_path) as f:
         result = parse_transcript_result(f)
@@ -774,6 +826,12 @@ limit_max_wait_hours: 6
 # timeouts with timeout_multiplier.
 # base_url: http://127.0.0.1:8080
 # timeout_multiplier: 6
+# Sandbox the agents in Docker: only the throwaway work dir is mounted, so
+# the host filesystem, credentials and config are unreachable. Build once:
+#   docker build -t autoskill-trial docker/
+# docker_image: autoskill-trial
+# docker_memory: 4g
+# docker_cpus: 4
 """
 
 DEFAULT_DIRECTIVES = """\

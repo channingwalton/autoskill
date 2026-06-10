@@ -31,7 +31,8 @@ the skill tax isn't worth paying).
 ## Layout
 
 - `bin/autoskill` — Python 3 stdlib driver: `init-run`, `check-tasks`, `trial`,
-  `suite`, `baseline`, `evolve`
+  `suite`, `baseline`, `evolve`, `report`
+- `docker/Dockerfile` — the trial sandbox image (`docker_image` in config)
 - `suites/<name>/` — a task suite: `suite.yaml` (skill_name, description),
   `directives.md` (default research programme, copied into new runs), and
   `tasks/<id>/` — fixture repo + `prompt.md` + `task.yaml` + hidden oracle +
@@ -48,6 +49,7 @@ bin/autoskill check-tasks                 # validate every suite's oracles both 
 bin/autoskill init-run runs/exp-1 --suite software-development \
   --model claude-sonnet-4-6 --mutator-model claude-sonnet-4-6
 # auth: claude setup-token -> save to ~/.config/autoskill/token (chmod 600; NOT in this repo)
+docker build -t autoskill-trial docker/   # sandbox image; set docker_image in config.yaml
 bin/autoskill baseline runs/exp-1         # no-skill incumbent over all tasks
 bin/autoskill evolve runs/exp-1 --hours 8 # the loop; resumable, just rerun it
 tail -f runs/exp-1/ledger.jsonl
@@ -175,9 +177,15 @@ rather than recording garbage verdicts.
 
 ## Safety notes
 
-- Trials run with `--dangerously-skip-permissions` in a throwaway temp dir, but
-  that is **not** a sandbox — the trial agent can reach the network and the
-  wider filesystem. Containerising trials is future work.
+- Trials run with `--dangerously-skip-permissions`. Set `docker_image` in
+  `config.yaml` to cage them: each trial (and the mutator) runs in a
+  throwaway container with **only its work dir mounted** — the host
+  filesystem, credentials and config are unreachable, with memory/CPU/pid
+  limits applied. Build the image once: `docker build -t autoskill-trial
+  docker/`. The container can still reach the network (it must, to talk to
+  the model server); `base_url` loopback addresses are rewritten to
+  `host.docker.internal` automatically. Without `docker_image`, trials run
+  directly on the host in a temp dir — **not** a sandbox.
 - Trials use an isolated `CLAUDE_CONFIG_DIR` so your global CLAUDE.md, skills,
   hooks and MCP servers cannot contaminate the experiment. Keychain auth does
   not carry over: mint a token with `claude setup-token` and keep it **outside
