@@ -18,10 +18,12 @@ import datetime
 import difflib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 # ---------------------------------------------------------------- yaml-lite
 
@@ -298,6 +300,70 @@ def run_oracle(oracle_path, work_dir):
     return out
 
 
+# ---------------------------------------------------------------- capacity
+
+class StopRun(Exception):
+    """Abort the current command cleanly; the ledger makes a rerun resume."""
+
+
+INFRA_PATTERN = re.compile(
+    r"usage limit|rate limit|limit reached|limit will reset|not logged in"
+    r"|credit balance|overloaded|service unavailable|capacity constraints",
+    re.IGNORECASE)
+
+
+def is_infra_failure(record):
+    """A trial that died before doing any work: errored, spent nothing, and
+    the platform said why (usage limit, auth, overload). Distinct from a task
+    failure, which costs money and must be scored honestly."""
+    if not record.get("is_error"):
+        return False
+    if record.get("cost_usd"):
+        return False
+    return bool(INFRA_PATTERN.search(record.get("final_message") or ""))
+
+
+def is_zero_cost_error(record):
+    return bool(record.get("is_error")) and not record.get("cost_usd")
+
+
+def capacity_probe(run_dir, config):
+    """Cheapest possible end-to-end call. True when the platform serves us."""
+    try:
+        proc = subprocess.run(
+            [config.get("claude_bin", "claude"), "-p", "Reply with OK",
+             "--output-format", "json", "--max-turns", "1",
+             "--model", str(config["model"]),
+             "--dangerously-skip-permissions"],
+            capture_output=True, text=True, timeout=120,
+            env=claude_env(run_dir), cwd=tempfile.gettempdir())
+        data = json.loads(proc.stdout.strip().splitlines()[-1])
+        return not data.get("is_error", True)
+    except Exception:
+        return False
+
+
+def wait_for_capacity(run_dir, config, deadline=None,
+                      sleep_fn=time.sleep, probe_fn=None):
+    """Block until a capacity probe succeeds. Subscription windows refresh on
+    a cycle (~5h), so poll patiently; raise StopRun past the cap or deadline."""
+    poll_s = max(60, int(float(config.get("limit_poll_minutes", 15)) * 60))
+    max_wait_s = int(float(config.get("limit_max_wait_hours", 6)) * 3600)
+    probe = probe_fn or (lambda: capacity_probe(run_dir, config))
+    waited = 0
+    while waited < max_wait_s:
+        if deadline and datetime.datetime.now() >= deadline:
+            raise StopRun("deadline reached while waiting for capacity")
+        print("capacity exhausted — retrying in %d min (waited %d min so far)"
+              % (poll_s // 60, waited // 60), file=sys.stderr)
+        sleep_fn(poll_s)
+        waited += poll_s
+        if probe():
+            print("capacity restored — resuming", file=sys.stderr)
+            return
+    raise StopRun("no capacity after %.1f h of waiting" % (max_wait_s / 3600))
+
+
 # ---------------------------------------------------------------- trial
 
 TOKEN_FILE = os.path.expanduser("~/.config/autoskill/token")
@@ -408,7 +474,32 @@ def run_trial(run_dir, task, candidate_dir, out_dir, config, keep_work=False):
             shutil.rmtree(work, ignore_errors=True)
 
 
-def run_suite(run_dir, label, candidate_dir, task_list, config):
+def run_trial_robust(run_dir, task, candidate_dir, out_dir, config, deadline=None):
+    """run_trial, but infrastructure failures (usage limit, auth, overload —
+    errored AND zero spend) never become scores: wait for capacity and re-run.
+    Unrecognised zero-cost errors retry once, then abort the run loudly."""
+    unrecognised = 0
+    for _ in range(4):
+        record = run_trial(run_dir, task, candidate_dir, out_dir, config)
+        if is_infra_failure(record):
+            print("infra failure on %s: %s" % (
+                task["id"], (record.get("final_message") or "")[:120]),
+                file=sys.stderr)
+            wait_for_capacity(run_dir, config, deadline)
+            continue
+        if is_zero_cost_error(record):
+            unrecognised += 1
+            if unrecognised >= 2:
+                raise StopRun(
+                    "trial %s repeatedly errors without spending — likely a "
+                    "config/auth problem, not a task failure: %s"
+                    % (task["id"], (record.get("final_message") or "")[:200]))
+            continue
+        return record
+    raise StopRun("trial %s could not complete after capacity waits" % task["id"])
+
+
+def run_suite(run_dir, label, candidate_dir, task_list, config, deadline=None):
     """Run trials for task_list; returns (records_by_id, aggregate)."""
     records = {}
     skill_text = ""
@@ -417,7 +508,8 @@ def run_suite(run_dir, label, candidate_dir, task_list, config):
             skill_text = f.read()
     for task in task_list:
         out_dir = os.path.join(run_dir, "trials", str(label), task["id"])
-        record = run_trial(run_dir, task, candidate_dir, out_dir, config)
+        record = run_trial_robust(run_dir, task, candidate_dir, out_dir, config,
+                                  deadline)
         records[task["id"]] = record
         print("  %-28s score=%+.3f passed=%d/%d cost=$%.3f%s" % (
             task["id"], record["score"], record["passed"], record["total"],
@@ -535,9 +627,35 @@ def ledger_tail_text(entries, limit=10):
     )
 
 
-def run_mutator(run_dir, iteration, champion, entries, optimise, config):
+def run_mutator(run_dir, iteration, champion, entries, optimise, config,
+                deadline=None):
+    """Capacity-robust wrapper around the mutator call: infrastructure
+    failures wait and retry instead of becoming reject verdicts."""
+    unrecognised = 0
+    for _ in range(4):
+        cand_dir, summary, cost, result = _run_mutator_once(
+            run_dir, iteration, champion, entries, optimise, config)
+        if result is not None and is_infra_failure(result):
+            print("infra failure in mutator: %s"
+                  % (result.get("final_message") or "")[:120], file=sys.stderr)
+            wait_for_capacity(run_dir, config, deadline)
+            continue
+        if result is not None and is_zero_cost_error(result) and cand_dir is None:
+            unrecognised += 1
+            if unrecognised >= 2:
+                raise StopRun(
+                    "mutator repeatedly errors without spending — likely a "
+                    "config/auth problem: %s"
+                    % (result.get("final_message") or "")[:200])
+            continue
+        return cand_dir, summary, cost
+    raise StopRun("mutator could not complete after capacity waits")
+
+
+def _run_mutator_once(run_dir, iteration, champion, entries, optimise, config):
     """One claude -p call that writes SKILL.md + SUMMARY.txt into candidates/<iter>/.
-    Returns (candidate_dir, summary, cost_usd) or (None, reason, cost) on failure."""
+    Returns (candidate_dir, summary, cost_usd, result_event_dict);
+    candidate_dir is None on failure, with the reason in summary."""
     cand_dir = os.path.join(run_dir, "candidates", str(iteration))
     os.makedirs(cand_dir, exist_ok=True)
     with open(os.path.join(repo_root(), "templates", "mutate.md")) as f:
@@ -572,12 +690,12 @@ def run_mutator(run_dir, iteration, champion, entries, optimise, config):
                            stderr=subprocess.DEVNULL,
                            timeout=int(config.get("mutator_timeout_s", 600)))
         except subprocess.TimeoutExpired:
-            return None, "reject-mutator-timeout", 0.0
+            return None, "reject-mutator-timeout", 0.0, None
     with open(transcript_path) as f:
         result = parse_transcript_result(f)
     cost = result["cost_usd"] or 0.0
     if not os.path.exists(os.path.join(cand_dir, "SKILL.md")):
-        return None, "reject-no-candidate", cost
+        return None, "reject-no-candidate", cost, result
     summary = "(no summary)"
     summary_path = os.path.join(cand_dir, "SUMMARY.txt")
     if os.path.exists(summary_path):
@@ -585,7 +703,7 @@ def run_mutator(run_dir, iteration, champion, entries, optimise, config):
             content = f.read().strip()
         if content:
             summary = content.splitlines()[0]
-    return cand_dir, summary, cost
+    return cand_dir, summary, cost, result
 
 
 # ---------------------------------------------------------------- subcommands
@@ -607,6 +725,9 @@ max_budget_usd: 50
 max_consecutive_rejects: 15
 mutator_max_turns: 16
 mutator_timeout_s: 600
+# capacity waits: usage-limit windows refresh on a cycle; poll until restored
+limit_poll_minutes: 15
+limit_max_wait_hours: 6
 """
 
 DEFAULT_DIRECTIVES = """\
@@ -817,7 +938,7 @@ def cmd_evolve(args):
 
         iter_cost = 0.0
         cand_dir, summary, mut_cost = run_mutator(
-            run_dir, iteration, champion, entries, optimise, config)
+            run_dir, iteration, champion, entries, optimise, config, deadline)
         iter_cost += mut_cost
         row = {"type": "iteration", "iter": iteration,
                "parent_iter": champion["iter"], "mutation_summary": summary}
@@ -841,7 +962,7 @@ def cmd_evolve(args):
             s1_ids = stage1_tasks(opt_ids, iteration, int(config.get("stage1_size", 3)))
             s1_tasks = [t for t in optimise if t["id"] in s1_ids]
             s1_records, s1_agg = run_suite(run_dir, "%d-stage1" % iteration,
-                                           cand_dir, s1_tasks, config)
+                                           cand_dir, s1_tasks, config, deadline)
             iter_cost += sum((r["cost_usd"] or 0.0) for r in s1_records.values())
             champ_s1_agg = aggregate(
                 [champion["per_task"][tid] for tid in s1_ids],
@@ -853,7 +974,7 @@ def cmd_evolve(args):
         if verdict is None:
             remaining = [t for t in optimise if t["id"] not in s1_ids]
             rest_records, _ = run_suite(run_dir, "%d-full" % iteration,
-                                        cand_dir, remaining, config)
+                                        cand_dir, remaining, config, deadline)
             iter_cost += sum((r["cost_usd"] or 0.0) for r in rest_records.values())
             all_records = {**s1_records, **rest_records}
             full_agg = aggregate([r["score"] for r in all_records.values()],
@@ -865,7 +986,7 @@ def cmd_evolve(args):
 
         if verdict is None:
             hold_records, hold_agg = run_suite(run_dir, "%d-holdout" % iteration,
-                                               cand_dir, holdout, config)
+                                               cand_dir, holdout, config, deadline)
             iter_cost += sum((r["cost_usd"] or 0.0) for r in hold_records.values())
             hold_info = {"agg": hold_agg,
                          "per_task": {k: v["score"] for k, v in hold_records.items()}}
@@ -1040,7 +1161,12 @@ def main(argv=None):
     p.set_defaults(fn=cmd_report)
 
     args = parser.parse_args(argv)
-    return args.fn(args) or 0
+    try:
+        return args.fn(args) or 0
+    except StopRun as stop:
+        print("stopped: %s\nrerun the same command to resume — the ledger "
+              "carries the state" % stop, file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

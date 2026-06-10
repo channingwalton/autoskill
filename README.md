@@ -145,6 +145,14 @@ also produce flat trajectories.
 Stops on max iterations, budget, reject streak, or deadline. Crash-safe:
 `evolve` resumes from the ledger.
 
+Capacity-robust: a trial that errors **without spending** and carries a
+platform message (usage limit, rate limit, auth, overload) is an
+infrastructure failure, never a score. The loop pauses, probes cheaply every
+`limit_poll_minutes`, and resumes when the usage window refreshes (subscription
+windows reset on a ~5h cycle); it gives up after `limit_max_wait_hours`.
+Unrecognised zero-spend errors (e.g. a bad model name) abort the run loudly
+rather than recording garbage verdicts.
+
 ## Safety notes
 
 - Trials run with `--dangerously-skip-permissions` in a throwaway temp dir, but

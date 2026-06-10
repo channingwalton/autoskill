@@ -229,5 +229,57 @@ class TestOracleParsing(unittest.TestCase):
             self.assertIn("error", out)
 
 
+class TestInfraFailure(unittest.TestCase):
+    def test_usage_limit_is_infra(self):
+        self.assertTrue(a.is_infra_failure(
+            {"is_error": True, "cost_usd": 0,
+             "final_message": "Claude usage limit reached. Your limit will reset at 5pm"}))
+
+    def test_not_logged_in_is_infra(self):
+        self.assertTrue(a.is_infra_failure(
+            {"is_error": True, "cost_usd": None,
+             "final_message": "Not logged in · Please run /login"}))
+
+    def test_real_failure_with_cost_is_not_infra(self):
+        # max-turns exhaustion spent money: a genuine attempt, score it
+        self.assertFalse(a.is_infra_failure(
+            {"is_error": True, "cost_usd": 0.18,
+             "final_message": "usage limit"}))
+
+    def test_unrecognised_zero_cost_error_is_not_infra(self):
+        rec = {"is_error": True, "cost_usd": 0, "final_message": "model not found"}
+        self.assertFalse(a.is_infra_failure(rec))
+        self.assertTrue(a.is_zero_cost_error(rec))
+
+    def test_success_is_neither(self):
+        rec = {"is_error": False, "cost_usd": 0.1, "final_message": "done"}
+        self.assertFalse(a.is_infra_failure(rec))
+        self.assertFalse(a.is_zero_cost_error(rec))
+
+
+class TestWaitForCapacity(unittest.TestCase):
+    CONFIG = {"limit_poll_minutes": 15, "limit_max_wait_hours": 1, "model": "m"}
+
+    def test_returns_when_probe_recovers(self):
+        sleeps = []
+        probes = iter([False, False, True])
+        a.wait_for_capacity("unused-run", self.CONFIG,
+                            sleep_fn=sleeps.append, probe_fn=lambda: next(probes))
+        self.assertEqual(len(sleeps), 3)
+        self.assertEqual(sleeps[0], 15 * 60)
+
+    def test_raises_past_max_wait(self):
+        with self.assertRaises(a.StopRun):
+            a.wait_for_capacity("unused-run", self.CONFIG,
+                                sleep_fn=lambda s: None, probe_fn=lambda: False)
+
+    def test_raises_at_deadline(self):
+        import datetime
+        past = datetime.datetime.now() - datetime.timedelta(seconds=1)
+        with self.assertRaises(a.StopRun):
+            a.wait_for_capacity("unused-run", self.CONFIG, deadline=past,
+                                sleep_fn=lambda s: None, probe_fn=lambda: False)
+
+
 if __name__ == "__main__":
     unittest.main()
