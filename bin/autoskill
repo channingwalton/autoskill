@@ -115,10 +115,13 @@ def frontmatter_name(text, fallback):
 def parse_transcript_result(lines):
     """Find the last {"type":"result"} event in stream-json output.
 
-    Returns dict(cost_usd, num_turns, is_error, final_message). Missing result
-    event means the session died: is_error True.
+    Returns dict(cost_usd, num_turns, is_error, final_message, has_activity).
+    Missing result event means the session died: is_error True. has_activity
+    is True when any assistant event appeared — the model did real work, even
+    if the session later timed out or errored.
     """
     result = None
+    activity = False
     for line in lines:
         line = line.strip()
         if not line:
@@ -127,15 +130,21 @@ def parse_transcript_result(lines):
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(event, dict) and event.get("type") == "result":
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "assistant":
+            activity = True
+        if event.get("type") == "result":
             result = event
     if result is None:
-        return {"cost_usd": None, "num_turns": 0, "is_error": True, "final_message": ""}
+        return {"cost_usd": None, "num_turns": 0, "is_error": True,
+                "final_message": "", "has_activity": activity}
     return {
         "cost_usd": result.get("total_cost_usd"),
         "num_turns": result.get("num_turns", 0),
         "is_error": bool(result.get("is_error", False)),
         "final_message": result.get("result") or "",
+        "has_activity": activity,
     }
 
 
@@ -312,19 +321,27 @@ INFRA_PATTERN = re.compile(
     re.IGNORECASE)
 
 
+def did_work(record):
+    """The model did real work this trial: spent money, or (local serving,
+    where real spend is always $0) produced assistant turns or a fictional
+    cost figure."""
+    return bool(record.get("cost_usd") or record.get("cost_reported")
+                or record.get("has_activity"))
+
+
 def is_infra_failure(record):
     """A trial that died before doing any work: errored, spent nothing, and
     the platform said why (usage limit, auth, overload). Distinct from a task
-    failure, which costs money and must be scored honestly."""
+    failure, which does real work and must be scored honestly."""
     if not record.get("is_error"):
         return False
-    if record.get("cost_usd"):
+    if did_work(record):
         return False
     return bool(INFRA_PATTERN.search(record.get("final_message") or ""))
 
 
 def is_zero_cost_error(record):
-    return bool(record.get("is_error")) and not record.get("cost_usd")
+    return bool(record.get("is_error")) and not did_work(record)
 
 
 def capacity_probe(run_dir, config):
@@ -336,7 +353,7 @@ def capacity_probe(run_dir, config):
              "--model", str(config["model"]),
              "--dangerously-skip-permissions"],
             capture_output=True, text=True, timeout=120,
-            env=claude_env(run_dir), cwd=tempfile.gettempdir())
+            env=claude_env(run_dir, config), cwd=tempfile.gettempdir())
         data = json.loads(proc.stdout.strip().splitlines()[-1])
         return not data.get("is_error", True)
     except Exception:
@@ -369,13 +386,25 @@ def wait_for_capacity(run_dir, config, deadline=None,
 TOKEN_FILE = os.path.expanduser("~/.config/autoskill/token")
 
 
-def claude_env(run_dir):
+def claude_env(run_dir, config=None):
     """Env for headless trials: isolated config dir, plus an OAuth token
     (created via `claude setup-token`). The token never lives in this repo:
     an already-exported CLAUDE_CODE_OAUTH_TOKEN wins, otherwise the file at
-    $AUTOSKILL_TOKEN_FILE or ~/.config/autoskill/token is used."""
+    $AUTOSKILL_TOKEN_FILE or ~/.config/autoskill/token is used.
+
+    When config has base_url (local serving, e.g. llama.cpp's /v1/messages),
+    everything talks to that server with a dummy key instead — the real OAuth
+    token is deliberately never put in the env, so it cannot leak to a local
+    server's logs."""
     env = dict(os.environ)
     env["CLAUDE_CONFIG_DIR"] = os.path.abspath(os.path.join(run_dir, "clean-config"))
+    base_url = (config or {}).get("base_url")
+    if base_url:
+        env["ANTHROPIC_BASE_URL"] = str(base_url)
+        env["ANTHROPIC_AUTH_TOKEN"] = "local"
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        env.pop("ANTHROPIC_API_KEY", None)
+        return env
     if not env.get("CLAUDE_CODE_OAUTH_TOKEN"):
         token_path = os.environ.get("AUTOSKILL_TOKEN_FILE", TOKEN_FILE)
         if os.path.exists(token_path):
@@ -418,7 +447,7 @@ def run_trial(run_dir, task, candidate_dir, out_dir, config, keep_work=False):
         with open(task["prompt"]) as f:
             prompt = f.read()
 
-        env = claude_env(run_dir)
+        env = claude_env(run_dir, config)
         cmd = [
             config.get("claude_bin", "claude"), "-p", prompt,
             "--output-format", "stream-json", "--verbose",
@@ -428,10 +457,11 @@ def run_trial(run_dir, task, candidate_dir, out_dir, config, keep_work=False):
         ]
         transcript_path = os.path.join(out_dir, "transcript.jsonl")
         timed_out = False
+        timeout_s = int(task["timeout_s"] * float(config.get("timeout_multiplier", 1)))
         with open(transcript_path, "w") as transcript:
             try:
                 subprocess.run(cmd, cwd=work, env=env, stdout=transcript,
-                               stderr=subprocess.DEVNULL, timeout=task["timeout_s"])
+                               stderr=subprocess.DEVNULL, timeout=timeout_s)
             except subprocess.TimeoutExpired:
                 timed_out = True
 
@@ -446,10 +476,16 @@ def run_trial(run_dir, task, candidate_dir, out_dir, config, keep_work=False):
 
         # The oracle always judges the work dir as-is (running out of turns is
         # budget exhaustion, not disqualification — the cost term punishes it).
-        # Unknown cost (crash/timeout) is charged at the budget cap.
-        cost = result["cost_usd"]
-        if cost is None:
+        # Unknown cost (crash/timeout) is charged at the budget cap. Local
+        # serving (base_url): real spend is $0 and Claude Code's reported
+        # figure is fictional API pricing — keep it as cost_reported only.
+        reported = result["cost_usd"]
+        if config.get("base_url"):
+            cost = 0.0
+        elif reported is None:
             cost = task["budget_usd"]
+        else:
+            cost = reported
 
         score = task_score(oracle["passed"], oracle["total"], cost,
                            task["budget_usd"], float(config.get("alpha", 0.25)))
@@ -459,9 +495,11 @@ def run_trial(run_dir, task, candidate_dir, out_dir, config, keep_work=False):
             "passed": oracle["passed"],
             "total": oracle["total"],
             "cost_usd": cost,
+            "cost_reported": reported,
             "num_turns": result["num_turns"],
             "is_error": result["is_error"],
             "timed_out": timed_out,
+            "has_activity": result.get("has_activity", False),
             "final_message": result["final_message"][-4000:],
         }
         with open(os.path.join(out_dir, "score.json"), "w") as f:
@@ -675,7 +713,7 @@ def _run_mutator_once(run_dir, iteration, champion, entries, optimise, config):
     with open(os.path.join(cand_dir, "mutate-prompt.md"), "w") as f:
         f.write(prompt)
 
-    env = claude_env(run_dir)
+    env = claude_env(run_dir, config)
     cmd = [
         config.get("claude_bin", "claude"), "-p", prompt,
         "--output-format", "stream-json", "--verbose",
@@ -693,7 +731,7 @@ def _run_mutator_once(run_dir, iteration, champion, entries, optimise, config):
             return None, "reject-mutator-timeout", 0.0, None
     with open(transcript_path) as f:
         result = parse_transcript_result(f)
-    cost = result["cost_usd"] or 0.0
+    cost = 0.0 if config.get("base_url") else (result["cost_usd"] or 0.0)
     if not os.path.exists(os.path.join(cand_dir, "SKILL.md")):
         return None, "reject-no-candidate", cost, result
     summary = "(no summary)"
@@ -728,6 +766,14 @@ mutator_timeout_s: 600
 # capacity waits: usage-limit windows refresh on a cycle; poll until restored
 limit_poll_minutes: 15
 limit_max_wait_hours: 6
+# Local serving: point everything (trials AND mutator) at a server that
+# speaks Anthropic /v1/messages (llama.cpp llama-server does natively).
+# model/mutator_model must then be the local model id, real spend records
+# as $0 (set alpha: 0 — the reported cost is fictional API pricing), and
+# no OAuth token is ever sent. Local inference is slower: scale per-task
+# timeouts with timeout_multiplier.
+# base_url: http://127.0.0.1:8080
+# timeout_multiplier: 6
 """
 
 DEFAULT_DIRECTIVES = """\

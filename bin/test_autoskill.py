@@ -101,12 +101,18 @@ class TestTranscriptParsing(unittest.TestCase):
         ]
         out = a.parse_transcript_result(lines)
         self.assertEqual(out, {"cost_usd": 0.12, "num_turns": 7,
-                               "is_error": False, "final_message": "done"})
+                               "is_error": False, "final_message": "done",
+                               "has_activity": True})
 
     def test_missing_result_is_error(self):
         out = a.parse_transcript_result([json.dumps({"type": "assistant"})])
         self.assertTrue(out["is_error"])
         self.assertIsNone(out["cost_usd"])
+        self.assertTrue(out["has_activity"])
+
+    def test_no_activity_without_assistant_events(self):
+        out = a.parse_transcript_result([json.dumps({"type": "system"})])
+        self.assertFalse(out["has_activity"])
 
 
 class TestAcceptRule(unittest.TestCase):
@@ -255,6 +261,42 @@ class TestInfraFailure(unittest.TestCase):
         rec = {"is_error": False, "cost_usd": 0.1, "final_message": "done"}
         self.assertFalse(a.is_infra_failure(rec))
         self.assertFalse(a.is_zero_cost_error(rec))
+
+    def test_local_trial_with_activity_is_honest_failure(self):
+        # base_url runs record cost 0 always — assistant activity proves
+        # real work, so an errored/timed-out trial is scored, not retried
+        rec = {"is_error": True, "cost_usd": 0.0, "cost_reported": None,
+               "has_activity": True, "final_message": "usage limit"}
+        self.assertFalse(a.is_infra_failure(rec))
+        self.assertFalse(a.is_zero_cost_error(rec))
+
+    def test_local_fictional_cost_counts_as_work(self):
+        rec = {"is_error": True, "cost_usd": 0.0, "cost_reported": 0.14,
+               "has_activity": False, "final_message": "service unavailable"}
+        self.assertFalse(a.is_infra_failure(rec))
+        self.assertFalse(a.is_zero_cost_error(rec))
+
+
+class TestClaudeEnv(unittest.TestCase):
+    def test_base_url_never_carries_oauth_token(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            old = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+            os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "sk-real-secret"
+            try:
+                env = a.claude_env(run_dir, {"base_url": "http://127.0.0.1:8080"})
+            finally:
+                if old is None:
+                    del os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+                else:
+                    os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = old
+            self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8080")
+            self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "local")
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
+
+    def test_no_base_url_keeps_token_path(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            env = a.claude_env(run_dir, {})
+            self.assertNotIn("ANTHROPIC_BASE_URL", env)
 
 
 class TestWaitForCapacity(unittest.TestCase):

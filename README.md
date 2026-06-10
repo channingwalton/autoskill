@@ -58,6 +58,26 @@ Models: pick the trial-agent and mutator models at `init-run` (or edit
 override for experiments; `baseline` and `evolve` intentionally do not —
 changing the trial model mid-run would void every comparison in the ledger.
 
+### Local models
+
+Any server speaking Anthropic `/v1/messages` works — llama.cpp's
+`llama-server` does natively. Set in `config.yaml`:
+
+```yaml
+model: Qwen/Qwen3-Coder-Next-GGUF        # the server's model id
+mutator_model: Qwen/Qwen3-Coder-Next-GGUF
+base_url: http://127.0.0.1:8080
+alpha: 0                                  # reported costs are fictional API pricing
+timeout_multiplier: 6                     # local inference is slower
+```
+
+With `base_url` set, trials, the mutator and the capacity probe all talk to
+the local server; real spend records as `$0` (`cost_reported` keeps the
+fictional figure); the OAuth token is deliberately never put in the
+environment, so it cannot leak into a local server's logs. Mind the server's
+context window: Claude Code's system prompt costs ~25k tokens before the task
+starts, so serve with at least 64k.
+
 Debugging single trials:
 
 ```sh
