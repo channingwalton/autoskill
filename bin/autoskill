@@ -416,6 +416,17 @@ def claude_env(run_dir, config=None):
     return env
 
 
+def skill_body(text):
+    """Strip the YAML frontmatter: injection delivers the guidance text
+    itself; name/description are skill-machinery metadata."""
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                return "\n".join(lines[i + 1:]).strip() + "\n"
+    return text
+
+
 def container_base_url(base_url):
     """Inside a container the host's loopback lives at host.docker.internal."""
     return re.sub(r"127\.0\.0\.1|localhost", "host.docker.internal",
@@ -471,11 +482,13 @@ def run_trial(run_dir, task, candidate_dir, out_dir, config, keep_work=False):
         if candidate_dir is not None:
             with open(os.path.join(candidate_dir, "SKILL.md")) as f:
                 skill_text = f.read()
-            name = frontmatter_name(skill_text, config.get("skill_name", "candidate"))
-            skill_dest = os.path.join(work, ".claude", "skills", name)
-            os.makedirs(skill_dest, exist_ok=True)
-            with open(os.path.join(skill_dest, "SKILL.md"), "w") as f:
-                f.write(skill_text)
+            if not config.get("inject_skill"):
+                name = frontmatter_name(skill_text,
+                                        config.get("skill_name", "candidate"))
+                skill_dest = os.path.join(work, ".claude", "skills", name)
+                os.makedirs(skill_dest, exist_ok=True)
+                with open(os.path.join(skill_dest, "SKILL.md"), "w") as f:
+                    f.write(skill_text)
 
         with open(task["prompt"]) as f:
             prompt = f.read()
@@ -488,6 +501,8 @@ def run_trial(run_dir, task, candidate_dir, out_dir, config, keep_work=False):
             "--model", str(config["model"]),
             "--dangerously-skip-permissions",
         ]
+        if candidate_dir is not None and config.get("inject_skill"):
+            claude_args += ["--append-system-prompt", skill_body(skill_text)]
         container = None
         if config.get("docker_image"):
             container = "autoskill-%s" % uuid.uuid4().hex[:12]
@@ -832,6 +847,11 @@ limit_max_wait_hours: 6
 # docker_image: autoskill-trial
 # docker_memory: 4g
 # docker_cpus: 4
+# Deliver the candidate via --append-system-prompt instead of installing it
+# as a skill. Skills only reach the agent if it chooses to invoke them —
+# some models never do; injection makes the candidate text unconditionally
+# expressed. The experiment then measures guidance text, not skill mechanics.
+# inject_skill: true
 """
 
 DEFAULT_DIRECTIVES = """\

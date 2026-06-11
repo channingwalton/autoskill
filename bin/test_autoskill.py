@@ -299,6 +299,19 @@ class TestClaudeEnv(unittest.TestCase):
             self.assertNotIn("ANTHROPIC_BASE_URL", env)
 
 
+class TestSkillBody(unittest.TestCase):
+    def test_strips_frontmatter(self):
+        text = "---\nname: x\ndescription: y\n---\n\n# Body\n\nRule one.\n"
+        self.assertEqual(a.skill_body(text), "# Body\n\nRule one.\n")
+
+    def test_no_frontmatter_passthrough(self):
+        self.assertEqual(a.skill_body("plain text\n"), "plain text\n")
+
+    def test_unclosed_frontmatter_passthrough(self):
+        text = "---\nname: x\nno closing fence\n"
+        self.assertEqual(a.skill_body(text), text)
+
+
 class TestDockerCmd(unittest.TestCase):
     CONFIG = {"docker_image": "autoskill-trial",
               "base_url": "http://127.0.0.1:8080"}

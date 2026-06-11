@@ -73,6 +73,13 @@ alpha: 0                                  # reported costs are fictional API pri
 timeout_multiplier: 6                     # local inference is slower
 ```
 
+Skills are opt-in at runtime: the agent only reads the body if it invokes the
+Skill tool, and some models never do (Qwen3-Coder-Next invoked it once in ~46
+trials, immune to imperative descriptions). For such models set
+`inject_skill: true` — the candidate body is delivered via
+`--append-system-prompt` instead, unconditionally expressed, and the
+experiment measures guidance text rather than skill mechanics.
+
 With `base_url` set, trials, the mutator and the capacity probe all talk to
 the local server; real spend records as `$0` (`cost_reported` keeps the
 fictional figure); the OAuth token is deliberately never put in the
