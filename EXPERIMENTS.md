@@ -73,6 +73,9 @@ ledgers; this file is the cross-run memory.
 
 ## Try-next queue
 
+**On hold — exp-3 is the final experiment for now (Channing, 2026-06-11).
+Items below are recorded ideas, not scheduled work.**
+
 1. **exp-3 candidates**: i1 first; judge by behaviour change in transcripts
    (probes appearing, edits beyond the obvious function), not score alone.
 2. **Fresh holdout tasks**: I (the current mutator) authored the suite, so
