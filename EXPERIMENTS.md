@@ -4,6 +4,23 @@ One entry per run: design, outcome, what it taught us, what to try next.
 Detailed in-run reasoning lives in `runs/<id>/mutator-notes.md` and the
 ledgers; this file is the cross-run memory.
 
+## How to read this file
+
+- **Scores** are aggregates (mean hidden-test pass rate − α·cost − λ·length;
+  see the README's scoring glossary). `+0.929` means ~93% of hidden oracle
+  tests passed across the task set, net of penalties.
+- **Candidate numbering**:
+  - *iterations 1…N* — candidates written by the scripted mutator model
+    inside an `evolve` run; the files live in `runs/<id>/candidates/<n>/`.
+  - *c1, c2, c3…* — candidates hand-written by Claude acting as mutator
+    (exp-2 takeover), delivered as installed skills.
+  - *i1, i2…* — hand-written candidates in injection mode (exp-3 onwards),
+    delivered via `--append-system-prompt`.
+- **Bar / acceptance**: champion optimise aggregate + ε. "NULL" means no
+  candidate cleared it (with the run healthy — zero infra-failure verdicts).
+- A claim like "0/3 Skill invocations" comes from grepping the per-trial
+  `transcript.jsonl` files under `runs/<id>/trials/<label>/`.
+
 ## exp-1 — Sonnet, scripted loop, cost+quality scoring (2026-06-09 → 10)
 
 - **Design**: trials + mutator `claude-sonnet-4-6` (API), α=0.25, λ=0.02,

@@ -133,6 +133,28 @@ Rules that make the loop trustworthy:
 - The trial harness git-commits the pristine fixture before the agent starts,
   so oracles may inspect `git diff` (e.g. minimal-diff criteria).
 
+## Scoring glossary
+
+- **task score** = `passed/total − α·min(cost/budget, 1.5)`. Range roughly
+  −0.375 to 1.0; with `alpha: 0` it is simply the hidden-test pass rate.
+- **aggregate** (`opt_agg`, `holdout_agg`) = mean of task scores over a task
+  set, minus the length penalty. This is the number candidates compete on.
+- **α (alpha)** — weight of the cost term. `0.25` makes spend matter;
+  `0` scores quality only (use with local serving, where cost is fictional).
+- **λ (lambda)** — skill-length penalty per 1k tokens of candidate text
+  (anti-bloat: every sentence must buy more than it costs).
+- **ε (epsilon)** — acceptance margin: a candidate must beat the champion's
+  optimise aggregate by ε, and not trail the champion's holdout aggregate by
+  more than ε. Guards against crowning noise.
+- **ε_cal** — calibrated ε used when running multi-pass evaluation:
+  `max(0.02, 2×SE)` of the mean-vs-mean comparison, measured from repeated
+  baseline passes. Single-pass aggregates on a ~10-task suite vary by ~±0.03
+  between identical runs, so an uncalibrated ε near that size is meaningless
+  (see exp-3 in `EXPERIMENTS.md`).
+- **budget_usd / max_turns / timeout_s** — per-task caps. Blowing a cap is
+  budget exhaustion, not disqualification: the oracle judges the work dir
+  as-is.
+
 ## Reading the results
 
 `bin/autoskill report runs/<id>` summarises a run: baseline vs champion (with
