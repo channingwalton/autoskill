@@ -33,6 +33,8 @@ the skill tax isn't worth paying).
 - `bin/autoskill` — Python 3 stdlib driver: `init-run`, `check-tasks`, `trial`,
   `suite`, `baseline`, `evolve`, `report`
 - `docker/Dockerfile` — the trial sandbox image (`docker_image` in config)
+- `EXPERIMENTS.md` — cross-run log: each experiment's design, outcome, what
+  it taught us, and the try-next queue
 - `suites/<name>/` — a task suite: `suite.yaml` (skill_name, description),
   `directives.md` (default research programme, copied into new runs), and
   `tasks/<id>/` — fixture repo + `prompt.md` + `task.yaml` + hidden oracle +
